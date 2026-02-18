@@ -41,6 +41,10 @@ fn init_repo(tmp: &TempDir) -> std::path::PathBuf {
     repo
 }
 
+fn normies_cmd() -> Command {
+    Command::new(assert_cmd::cargo::cargo_bin!("normies"))
+}
+
 #[test]
 fn e2e_run_review_integrate_publish_fake_docker() {
     let tmp = TempDir::new().expect("tempdir");
@@ -64,8 +68,7 @@ fn e2e_run_review_integrate_publish_fake_docker() {
 
     let run_id = "run-test-001";
 
-    Command::cargo_bin("normies")
-        .expect("cargo bin")
+    normies_cmd()
         .current_dir(tmp.path())
         .env("NORMIES_TEST_FAKE_DOCKER", "1")
         .args([
@@ -80,22 +83,19 @@ fn e2e_run_review_integrate_publish_fake_docker() {
         .assert()
         .success();
 
-    Command::cargo_bin("normies")
-        .expect("cargo bin")
+    normies_cmd()
         .current_dir(tmp.path())
         .args(["review", "--run-id", run_id])
         .assert()
         .success();
 
-    Command::cargo_bin("normies")
-        .expect("cargo bin")
+    normies_cmd()
         .current_dir(tmp.path())
         .args(["integrate", "--run-id", run_id])
         .assert()
         .success();
 
-    Command::cargo_bin("normies")
-        .expect("cargo bin")
+    normies_cmd()
         .current_dir(tmp.path())
         .args(["publish", "--run-id", run_id])
         .assert()

@@ -1300,10 +1300,10 @@ fn ensure_hub(repo_input: &str, repo_key: &str) -> Result<PathBuf> {
 
 fn create_run_id() -> String {
     let stamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut suffix = String::new();
     for _ in 0..6 {
-        suffix.push_str(&format!("{:x}", rng.gen_range(0..16)));
+        suffix.push_str(&format!("{:x}", rng.random_range(0..16)));
     }
     format!("{stamp}-{suffix}")
 }
@@ -1438,12 +1438,12 @@ fn docker_command(opts: DockerCmdOptions) -> Result<Vec<String>> {
         opts.pids_limit.to_string(),
         "--mount".to_string(),
         format!(
-            "type=bind,src={},dst=/work,rw",
+            "type=bind,src={},dst=/work",
             opts.worktree.canonicalize()?.to_string_lossy()
         ),
         "--mount".to_string(),
         format!(
-            "type=bind,src={},dst=/out,rw",
+            "type=bind,src={},dst=/out",
             opts.out_dir.canonicalize()?.to_string_lossy()
         ),
     ];
