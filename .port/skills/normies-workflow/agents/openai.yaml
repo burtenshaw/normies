@@ -1,4 +1,0 @@
-interface:
-  display_name: "Normies Workflow"
-  short_description: "Run Docker-isolated normies agent workflows"
-  default_prompt: "Use $normies-workflow to create a safe run spec and execute normies end-to-end for this repository."

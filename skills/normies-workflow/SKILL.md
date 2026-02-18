@@ -1,6 +1,6 @@
 ---
 name: normies-workflow
-description: Run the `normies` CLI to orchestrate Docker-isolated multi-agent Git workflows with local review/integration and optional final PR publication. Use when an agent needs to create or edit `normies` run specs, execute `normies run/review/integrate/publish/cleanup`, troubleshoot failed or blocked agent runs, or safely coordinate multiple branch-isolated agent commands against one repository.
+description: Run the `normies` CLI to orchestrate Docker-isolated multi-agent git workflows with local review/integration and optional final PR publication. Use when an agent needs to create or edit `normies` run specs, execute `normies run/review/integrate/publish/cleanup`, troubleshoot failed or blocked runs, or coordinate multiple branch-isolated commands against one repository.
 ---
 
 # Normies Workflow
@@ -8,17 +8,16 @@ description: Run the `normies` CLI to orchestrate Docker-isolated multi-agent Gi
 ## Overview
 
 Use this skill to execute reliable `normies` runs end to end.
-Prefer this workflow when coordinating multiple agent commands with strict Docker isolation and local Git-first review.
+Prefer this workflow when coordinating multiple agent commands with strict Docker isolation and local git-first review.
 
 ## Run Workflow
 
 1. Confirm prerequisites.
 Check `normies --help`.
 Check `docker info`.
-Use `uv tool install -e .` when `normies` is not installed.
 
 2. Build a spec.
-Use `scripts/make_spec.py` for fast, valid JSON specs.
+Use `normies make-spec` for fast, valid JSON specs.
 Read `references/spec-guide.md` for full field details and patterns.
 
 3. Execute the pipeline.
@@ -52,5 +51,4 @@ Add `--remove-run-dir` when you also want to remove run metadata and artifacts.
 
 ## Resources
 
-- `scripts/make_spec.py`: Generate valid JSON specs from CLI flags.
 - `references/spec-guide.md`: Review spec schema, command sequence, and troubleshooting tips.

@@ -67,10 +67,10 @@
 
 ## Fast Spec Generation
 
-Use the skill script:
+Use `normies make-spec`:
 
 ```bash
-./skills/normies-workflow/scripts/make_spec.py \
+normies make-spec \
   --output /tmp/normies-spec.json \
   --repo owner/repo \
   --agent "lint::npm ci && npm run lint" \
@@ -81,7 +81,7 @@ Use the skill script:
 Mark network-required agents:
 
 ```bash
-./skills/normies-workflow/scripts/make_spec.py \
+normies make-spec \
   --output /tmp/normies-spec.json \
   --repo owner/repo \
   --agent "deps::npm ci" \

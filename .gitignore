@@ -1,4 +1,5 @@
 .orchestrator/
-__pycache__/
+target/
 .venv/
+__pycache__/
 .pytest_cache/
