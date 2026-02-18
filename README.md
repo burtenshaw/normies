@@ -59,3 +59,18 @@ normies make-spec \
 ```bash
 cargo test
 ```
+
+## Quality Gate
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+Or use aliases:
+
+```bash
+cargo qa
+cargo ci
+```

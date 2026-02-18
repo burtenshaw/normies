@@ -19,3 +19,7 @@ serde_yaml = "0.9.34"
 assert_cmd = "2.1.1"
 serde_json = "1.0.145"
 tempfile = "3.23.0"
+
+[alias]
+qa = "clippy --all-targets --all-features -- -D warnings"
+ci = "test --all-targets --all-features"
