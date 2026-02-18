@@ -3,3 +3,8 @@ target/
 .venv/
 __pycache__/
 .pytest_cache/
+
+
+# benchmark
+benchmark/artifacts/
+benchmark/results/
