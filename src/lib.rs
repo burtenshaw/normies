@@ -255,7 +255,9 @@ pub fn run() -> i32 {
 
 fn cmd_run(args: &RunArgs) -> Result<()> {
     check_tool_exists("git")?;
-    check_tool_exists("docker")?;
+    if !fake_docker_mode() {
+        check_tool_exists("docker")?;
+    }
     ensure_docker_daemon()?;
     ensure_orch_dirs()?;
 
@@ -545,12 +547,7 @@ fn cmd_review(args: &ReviewArgs) -> Result<()> {
             let log_path = review_dir.join(format!("{}.log", agent.name));
             let check_results = run_local_checks(Path::new(&agent.worktree), &checks, &log_path)?;
             for item in check_results {
-                if item
-                    .get("exit_code")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(1)
-                    != 0
-                {
+                if item.get("exit_code").and_then(Value::as_i64).unwrap_or(1) != 0 {
                     failed_checks.push(item);
                 }
             }
@@ -586,10 +583,9 @@ fn cmd_review(args: &ReviewArgs) -> Result<()> {
 
 fn cmd_integrate(args: &IntegrateArgs) -> Result<()> {
     let mut manifest = repo_from_manifest(&args.run_id)?;
-    let review = manifest
-        .review
-        .clone()
-        .ok_or_else(|| anyhow!("review report missing; run 'normies review --run-id <id>' first"))?;
+    let review = manifest.review.clone().ok_or_else(|| {
+        anyhow!("review report missing; run 'normies review --run-id <id>' first")
+    })?;
 
     let hub_path = PathBuf::from(&manifest.hub_path);
     let run_dir = runs_dir().join(&manifest.run_id);
@@ -775,7 +771,10 @@ fn cmd_publish(args: &PublishArgs) -> Result<()> {
         "integration_branch".to_string(),
         Value::String(manifest.integration_branch.clone()),
     );
-    publish.insert("final_branch".to_string(), Value::String(final_branch.clone()));
+    publish.insert(
+        "final_branch".to_string(),
+        Value::String(final_branch.clone()),
+    );
     publish.insert("pushed".to_string(), Value::Bool(true));
     publish.insert("pr".to_string(), Value::Null);
 
@@ -983,7 +982,13 @@ fn cmd_make_spec(args: &MakeSpecArgs) -> Result<()> {
         mkdirp(parent)?;
     }
     write_json(&args.output, &Value::Object(spec))?;
-    println!("{}", args.output.canonicalize().unwrap_or(args.output.clone()).display());
+    println!(
+        "{}",
+        args.output
+            .canonicalize()
+            .unwrap_or(args.output.clone())
+            .display()
+    );
     Ok(())
 }
 
@@ -1057,7 +1062,11 @@ fn run_cmd(
             stderr.trim()
         );
     }
-    Ok(CmdOutput { code, stdout, stderr })
+    Ok(CmdOutput {
+        code,
+        stdout,
+        stderr,
+    })
 }
 
 fn run_logged(cmd: &[String], logfile: &Path, cwd: Option<&Path>) -> Result<i32> {
@@ -1091,10 +1100,11 @@ fn run_fake_docker(cmd: &[String], logfile: &Path) -> Result<i32> {
                 worktree = extract_mount_src(mount);
             }
         }
-        if cmd[i] == "-e" && i + 1 < cmd.len() {
-            if let Some((k, v)) = cmd[i + 1].split_once('=') {
-                env_map.insert(k.to_string(), v.to_string());
-            }
+        if cmd[i] == "-e"
+            && i + 1 < cmd.len()
+            && let Some((k, v)) = cmd[i + 1].split_once('=')
+        {
+            env_map.insert(k.to_string(), v.to_string());
         }
         i += 1;
     }
@@ -1399,22 +1409,12 @@ struct DockerCmdOptions {
 }
 
 fn current_uid_gid() -> (String, String) {
-    let uid = run_cmd(
-        vec!["id".to_string(), "-u".to_string()],
-        None,
-        false,
-        None,
-    )
-    .map(|o| o.stdout.trim().to_string())
-    .unwrap_or_else(|_| "0".to_string());
-    let gid = run_cmd(
-        vec!["id".to_string(), "-g".to_string()],
-        None,
-        false,
-        None,
-    )
-    .map(|o| o.stdout.trim().to_string())
-    .unwrap_or_else(|_| "0".to_string());
+    let uid = run_cmd(vec!["id".to_string(), "-u".to_string()], None, false, None)
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    let gid = run_cmd(vec!["id".to_string(), "-g".to_string()], None, false, None)
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_else(|_| "0".to_string());
     (uid, gid)
 }
 
