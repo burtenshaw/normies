@@ -81,6 +81,59 @@ normies logs --latest --agent <agent_name> --tail 200
 normies logs --latest --agent <agent_name> --follow
 ```
 
+## Host A2A Gateway (Opt-in)
+
+Enable per-run local A2A proxying with a Unix socket gateway:
+
+```yaml
+a2a_gateway:
+  enabled: true
+
+agents:
+  - name: planner
+    cmd: ./run-agent.sh
+    a2a:
+      serve: true
+      description: planning agent
+```
+
+When enabled, each agent receives:
+
+- `NORMIES_A2A_GATEWAY_SOCKET=/gateway/gateway.sock`
+- `NORMIES_A2A_GATEWAY_BASE_URL=http://a2a.local`
+- `NORMIES_A2A_AGENT_ID=<agent_name>`
+- `NORMIES_A2A_AGENT_SOCKET=/gateway/agents/<agent_name>.sock`
+- `NORMIES_A2A_TOKEN=<per-agent bearer token>`
+- `NORMIES_A2A_PEERS_JSON=<json peer map>`
+
+Gateway metadata is included in `run --json` and `status --json` under `gateway`.
+
+Useful OS tools:
+
+```bash
+# send request over UDS
+curl --unix-socket "$NORMIES_A2A_GATEWAY_SOCKET" \
+  -H "Authorization: Bearer $NORMIES_A2A_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"ping"}' \
+  "$NORMIES_A2A_GATEWAY_BASE_URL/v1/agents/<peer>/message:send"
+
+# stream events over UDS
+curl -N --unix-socket "$NORMIES_A2A_GATEWAY_SOCKET" \
+  -H "Authorization: Bearer $NORMIES_A2A_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"stream"}' \
+  "$NORMIES_A2A_GATEWAY_BASE_URL/v1/agents/<peer>/message:stream"
+
+# inspect sockets/logs
+lsof -U | rg gateway.sock
+ss -xl | rg gateway.sock
+tail -f .orchestrator/runs/<run_id>/gateway/gateway.log
+
+# debug UDS via local TCP bridge
+socat TCP-LISTEN:7777,reuseaddr,fork UNIX-CONNECT:"$NORMIES_A2A_GATEWAY_SOCKET"
+```
+
 Generate a JSON spec:
 
 ```bash

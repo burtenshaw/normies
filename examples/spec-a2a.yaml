@@ -1,0 +1,45 @@
+schema_version: 1
+repo: https://github.com/owner/repo.git
+base_ref: main
+image: ubuntu:24.04
+
+defaults:
+  cpus: "2"
+  memory: 4g
+  pids_limit: 256
+  needs_network: false
+  auto_commit: true
+  read_only_rootfs: false
+  commit_prefix: agent
+
+a2a_gateway:
+  enabled: true
+  transport: uds
+  auth: bearer
+
+agents:
+  - name: planner
+    cmd: |
+      printf '%s\n' "$NORMIES_A2A_GATEWAY_SOCKET" > GATEWAY_SOCKET.txt
+      printf '%s\n' "$NORMIES_A2A_AGENT_SOCKET" > AGENT_SOCKET.txt
+      printf '%s\n' "$NORMIES_A2A_TOKEN" > AGENT_TOKEN.txt
+      printf '%s\n' "$NORMIES_A2A_PEERS_JSON" > PEERS_JSON.txt
+      echo '{"status":"ok","summary":"planner wrote A2A env artifacts"}' > /out/result.json
+    a2a:
+      serve: true
+      description: Planning agent that serves A2A endpoints on NORMIES_A2A_AGENT_SOCKET
+      streaming: true
+      skills:
+        - id: planning.create
+          name: Create Plan
+          description: Build an implementation plan
+          tags: [planning, orchestration]
+
+  - name: reviewer
+    cmd: |
+      printf '%s\n' "$NORMIES_A2A_GATEWAY_BASE_URL" > GATEWAY_BASE_URL.txt
+      echo '{"status":"ok","summary":"reviewer consumed A2A gateway metadata"}' > /out/result.json
+    a2a:
+      serve: true
+      description: Review agent
+      streaming: true

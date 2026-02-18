@@ -602,3 +602,108 @@ fn integrate_json_includes_codex_handoff_metadata() {
         "expected merged_details entry for codex-agent: {report}"
     );
 }
+
+#[test]
+fn run_with_a2a_gateway_exposes_metadata_and_injects_env() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(&tmp);
+    let spec_path = tmp.path().join("spec.json");
+    fs::write(
+        &spec_path,
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "base_ref": "main",
+            "a2a_gateway": { "enabled": true },
+            "agents": [
+                {
+                    "name": "a2a-agent",
+                    "cmd": "printf '%s\\n' \"$NORMIES_A2A_GATEWAY_SOCKET\" > A2A_GATEWAY_SOCKET.txt\nprintf '%s\\n' \"$NORMIES_A2A_AGENT_SOCKET\" > A2A_AGENT_SOCKET.txt\nprintf '%s\\n' \"$NORMIES_A2A_TOKEN\" > A2A_TOKEN.txt\n",
+                    "a2a": { "serve": true, "description": "A2A test agent" }
+                }
+            ]
+        }))
+        .expect("serialize spec"),
+    )
+    .expect("write spec");
+
+    let run_id = "run-a2a-gateway-001";
+    let run_out = normies_cmd()
+        .current_dir(tmp.path())
+        .env("NORMIES_TEST_FAKE_DOCKER", "1")
+        .args([
+            "run",
+            "--repo",
+            repo.to_string_lossy().as_ref(),
+            "--spec",
+            spec_path.to_string_lossy().as_ref(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .output()
+        .expect("run should start");
+    assert!(
+        run_out.status.success(),
+        "run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run_out.stdout),
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+
+    let run_json: serde_json::Value = serde_json::from_slice(&run_out.stdout).expect("run json");
+    let gateway = run_json
+        .get("gateway")
+        .expect("gateway metadata in run json");
+    assert_eq!(
+        gateway
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        true,
+        "expected gateway.enabled=true: {run_json}"
+    );
+    let socket_path = gateway
+        .get("socket_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    assert!(
+        socket_path.contains("gateway.sock"),
+        "expected gateway socket path in run json: {run_json}"
+    );
+
+    let status = read_status(&tmp, run_id);
+    let agent = status
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .expect("first agent");
+    let worktree = PathBuf::from(
+        agent
+            .get("worktree")
+            .and_then(serde_json::Value::as_str)
+            .expect("agent worktree path"),
+    );
+    let worktree = if worktree.is_absolute() {
+        worktree
+    } else {
+        tmp.path().join(worktree)
+    };
+
+    let gateway_socket_value =
+        fs::read_to_string(worktree.join("A2A_GATEWAY_SOCKET.txt")).expect("gateway socket file");
+    let agent_socket_value =
+        fs::read_to_string(worktree.join("A2A_AGENT_SOCKET.txt")).expect("agent socket file");
+    let token_value = fs::read_to_string(worktree.join("A2A_TOKEN.txt")).expect("token file");
+
+    assert!(
+        !gateway_socket_value.trim().starts_with("/gateway/"),
+        "expected fake docker to rewrite gateway socket path: {gateway_socket_value}"
+    );
+    assert!(
+        !agent_socket_value.trim().starts_with("/gateway/"),
+        "expected fake docker to rewrite agent socket path: {agent_socket_value}"
+    );
+    assert!(
+        !token_value.trim().is_empty(),
+        "expected non-empty gateway token in injected env"
+    );
+}

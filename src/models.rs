@@ -14,6 +14,7 @@ pub struct Spec {
     pub image: Option<String>,
     pub defaults: Option<SpecDefaults>,
     pub review: Option<ReviewConfig>,
+    pub a2a_gateway: Option<A2aGatewayConfig>,
     #[serde(default)]
     pub agents: Vec<AgentSpec>,
 }
@@ -38,6 +39,65 @@ pub struct ReviewConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct A2aGatewayConfig {
+    pub enabled: bool,
+    pub transport: String,
+    pub auth: String,
+    pub bind_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub stream_idle_timeout_ms: u64,
+    pub max_payload_bytes: usize,
+}
+
+impl Default for A2aGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transport: "uds".to_string(),
+            auth: "bearer".to_string(),
+            bind_timeout_ms: 2_000,
+            request_timeout_ms: 30_000,
+            stream_idle_timeout_ms: 120_000,
+            max_payload_bytes: 1_048_576,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSkillSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentA2aConfig {
+    pub serve: bool,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<AgentSkillSpec>,
+    pub streaming: Option<bool>,
+}
+
+impl Default for AgentA2aConfig {
+    fn default() -> Self {
+        Self {
+            serve: false,
+            description: None,
+            skills: vec![],
+            streaming: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSpec {
     pub name: String,
@@ -56,6 +116,7 @@ pub struct AgentSpec {
     pub commit_message: Option<String>,
     #[serde(default)]
     pub required_checks: Vec<String>,
+    pub a2a: Option<AgentA2aConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +158,20 @@ pub struct RunManifest {
     pub state: String,
     pub review: Option<Value>,
     pub integration: Option<Value>,
+    pub gateway: Option<GatewayTelemetry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayTelemetry {
+    pub enabled: bool,
+    pub transport: String,
+    pub socket_path: String,
+    pub started_at: String,
+    pub stopped_at: String,
+    pub requests_total: u64,
+    pub auth_failures: u64,
+    pub proxy_errors: u64,
+    pub stream_sessions_peak: u64,
 }
 
 #[derive(Debug)]
@@ -136,4 +211,5 @@ pub struct PreparedAgent {
     pub pids_limit: i64,
     pub container_name: String,
     pub env_map: HashMap<String, String>,
+    pub gateway_dir: Option<PathBuf>,
 }

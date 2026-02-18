@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod gateway;
 mod models;
 mod runtime;
 

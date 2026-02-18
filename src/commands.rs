@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use rand::Rng;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -13,8 +14,10 @@ use crate::cli::{
     DEFAULT_PIDS_LIMIT, DoctorArgs, InitArgs, IntegrateArgs, LogsArgs, MakeSpecArgs, RetryArgs,
     ReviewArgs, RunArgs, StatusArgs,
 };
+use crate::gateway::{GatewayHandle, GatewayStartAgent, GatewayStartOptions, start_gateway};
 use crate::models::{
-    AgentSpec, AgentState, PreparedAgent, ReviewConfig, RunManifest, Spec, SpecDefaults,
+    A2aGatewayConfig, AgentSpec, AgentState, GatewayTelemetry, PreparedAgent, ReviewConfig,
+    RunManifest, Spec, SpecDefaults,
 };
 use crate::runtime::{
     DockerCmdOptions, check_tool_exists, create_run_id, docker_command,
@@ -102,6 +105,7 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
         state: "running".to_string(),
         review: None,
         integration: None,
+        gateway: None,
     };
     save_manifest(&manifest)?;
 
@@ -111,6 +115,9 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_IMAGE.to_string());
 
+    let selected_agents: Vec<&AgentSpec> = spec.agents.iter().collect();
+    let gateway_ctx = prepare_gateway_context(&spec, &selected_agents, &run_dir)?;
+
     let prepare_ctx = PrepareContext {
         run_id: &run_id,
         run_dir: &run_dir,
@@ -118,6 +125,11 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
         base_ref: &base_ref,
         defaults: &defaults,
         global_image: &global_image,
+        gateway: gateway_ctx.as_ref().map(|ctx| GatewayPrepareContext {
+            gateway_dir: &ctx.gateway_dir,
+            token_by_agent: &ctx.token_by_agent,
+            peers_json_by_agent: &ctx.peers_json_by_agent,
+        }),
     };
 
     let mut resolved_refs: HashSet<String> = HashSet::new();
@@ -129,7 +141,27 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
         prepared.push(prepare_agent(&prepare_ctx, agent, None)?);
     }
 
-    manifest.agents = execute_prepared_agents(prepared, args.jobs, !args.json)?;
+    let mut gateway_handle = if let Some(ctx) = gateway_ctx.as_ref() {
+        let handle = start_gateway(GatewayStartOptions {
+            run_id: run_id.clone(),
+            socket_path: ctx.gateway_socket_host.clone(),
+            log_path: ctx.gateway_log_path.clone(),
+            bind_timeout_ms: ctx.config.bind_timeout_ms,
+            request_timeout_ms: ctx.config.request_timeout_ms,
+            stream_idle_timeout_ms: ctx.config.stream_idle_timeout_ms,
+            max_payload_bytes: ctx.config.max_payload_bytes,
+            token_by_agent: ctx.token_by_agent.clone(),
+            agents: ctx.start_agents.clone(),
+        })?;
+        manifest.gateway = Some(handle.startup_telemetry());
+        Some(handle)
+    } else {
+        None
+    };
+
+    let execute_result = execute_prepared_agents(prepared, args.jobs, !args.json);
+    manifest.gateway = stop_gateway(gateway_handle.as_mut(), manifest.gateway.as_ref())?;
+    manifest.agents = execute_result?;
     manifest.state = "ran".to_string();
     manifest.updated_at = now_iso();
     save_manifest(&manifest)?;
@@ -160,6 +192,7 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
             "run_dir": run_dir.to_string_lossy().to_string(),
             "manifest_path": run_dir.join("run.json").to_string_lossy().to_string(),
             "agents": agents,
+            "gateway": manifest.gateway,
         }))?;
         return Ok(());
     }
@@ -227,6 +260,13 @@ fn cmd_retry(args: &RetryArgs) -> Result<()> {
         .map(|a| (a.name.clone(), a))
         .collect();
 
+    let selected_agents: Vec<&AgentSpec> = spec
+        .agents
+        .iter()
+        .filter(|agent| selected.contains(&agent.name))
+        .collect();
+    let gateway_ctx = prepare_gateway_context(&spec, &selected_agents, &run_dir)?;
+
     let prepare_ctx = PrepareContext {
         run_id: &manifest.run_id,
         run_dir: &run_dir,
@@ -234,6 +274,11 @@ fn cmd_retry(args: &RetryArgs) -> Result<()> {
         base_ref: &manifest.base_ref,
         defaults: &defaults,
         global_image: &global_image,
+        gateway: gateway_ctx.as_ref().map(|ctx| GatewayPrepareContext {
+            gateway_dir: &ctx.gateway_dir,
+            token_by_agent: &ctx.token_by_agent,
+            peers_json_by_agent: &ctx.peers_json_by_agent,
+        }),
     };
 
     let mut resolved_refs: HashSet<String> = HashSet::new();
@@ -248,7 +293,27 @@ fn cmd_retry(args: &RetryArgs) -> Result<()> {
         prepared.push(prepare_agent(&prepare_ctx, agent, branch_override)?);
     }
 
-    let rerun_states = execute_prepared_agents(prepared, args.jobs, !args.json)?;
+    let mut gateway_handle = if let Some(ctx) = gateway_ctx.as_ref() {
+        let handle = start_gateway(GatewayStartOptions {
+            run_id: manifest.run_id.clone(),
+            socket_path: ctx.gateway_socket_host.clone(),
+            log_path: ctx.gateway_log_path.clone(),
+            bind_timeout_ms: ctx.config.bind_timeout_ms,
+            request_timeout_ms: ctx.config.request_timeout_ms,
+            stream_idle_timeout_ms: ctx.config.stream_idle_timeout_ms,
+            max_payload_bytes: ctx.config.max_payload_bytes,
+            token_by_agent: ctx.token_by_agent.clone(),
+            agents: ctx.start_agents.clone(),
+        })?;
+        manifest.gateway = Some(handle.startup_telemetry());
+        Some(handle)
+    } else {
+        None
+    };
+
+    let rerun_result = execute_prepared_agents(prepared, args.jobs, !args.json);
+    manifest.gateway = stop_gateway(gateway_handle.as_mut(), manifest.gateway.as_ref())?;
+    let rerun_states = rerun_result?;
 
     let mut merged_by_name = existing_by_name;
     for state in &rerun_states {
@@ -297,6 +362,7 @@ fn cmd_retry(args: &RetryArgs) -> Result<()> {
             "run_dir": run_dir.to_string_lossy().to_string(),
             "manifest_path": run_dir.join("run.json").to_string_lossy().to_string(),
             "retried": retried,
+            "gateway": manifest.gateway,
         }))?;
         return Ok(());
     }
@@ -405,6 +471,14 @@ fn print_status_detail(manifest: &RunManifest, json_out: bool) -> Result<()> {
     println!("Manifest: {}", manifest_path.display());
     println!("Created: {}", manifest.created_at);
     println!("Updated: {}", manifest.updated_at);
+    if let Some(gateway) = &manifest.gateway {
+        println!(
+            "Gateway: enabled={} transport={} socket={}",
+            if gateway.enabled { "yes" } else { "no" },
+            gateway.transport,
+            gateway.socket_path
+        );
+    }
     println!();
     print_agent_summary(&manifest.agents);
     println!();
@@ -1734,6 +1808,7 @@ fn cmd_init(args: &InitArgs) -> Result<()> {
             commit_prefix: None,
             commit_message: None,
             required_checks: vec![],
+            a2a: None,
         })
         .collect::<Vec<_>>();
 
@@ -1744,6 +1819,7 @@ fn cmd_init(args: &InitArgs) -> Result<()> {
         image: Some(image),
         defaults: None,
         review: None,
+        a2a_gateway: None,
         agents,
     };
 
@@ -1895,6 +1971,7 @@ fn cmd_make_spec(args: &MakeSpecArgs) -> Result<()> {
             commit_prefix: None,
             commit_message: None,
             required_checks: vec![],
+            a2a: None,
         });
     }
 
@@ -1928,6 +2005,7 @@ fn cmd_make_spec(args: &MakeSpecArgs) -> Result<()> {
         review: Some(ReviewConfig {
             required_checks: args.checks.clone(),
         }),
+        a2a_gateway: None,
         agents,
     };
     validate_spec(&spec)?;
@@ -2019,6 +2097,123 @@ fn print_agent_summary(agents: &[AgentState]) {
     }
 }
 
+const A2A_GATEWAY_SOCKET_MOUNT: &str = "/gateway/gateway.sock";
+const A2A_GATEWAY_BASE_URL: &str = "http://a2a.local";
+
+struct GatewayRunContext {
+    config: A2aGatewayConfig,
+    gateway_dir: PathBuf,
+    gateway_socket_host: PathBuf,
+    gateway_log_path: PathBuf,
+    token_by_agent: HashMap<String, String>,
+    peers_json_by_agent: HashMap<String, String>,
+    start_agents: Vec<GatewayStartAgent>,
+}
+
+struct GatewayPrepareContext<'a> {
+    gateway_dir: &'a Path,
+    token_by_agent: &'a HashMap<String, String>,
+    peers_json_by_agent: &'a HashMap<String, String>,
+}
+
+fn random_bearer_token() -> String {
+    let mut rng = rand::rng();
+    let mut out = String::with_capacity(48);
+    for _ in 0..48 {
+        out.push_str(&format!("{:x}", rng.random_range(0..16)));
+    }
+    out
+}
+
+fn prepare_gateway_context(
+    spec: &Spec,
+    selected_agents: &[&AgentSpec],
+    run_dir: &Path,
+) -> Result<Option<GatewayRunContext>> {
+    let Some(config) = spec.a2a_gateway.clone() else {
+        return Ok(None);
+    };
+    if !config.enabled {
+        return Ok(None);
+    }
+    if selected_agents.is_empty() {
+        return Ok(None);
+    }
+
+    let gateway_dir = run_dir.join("gateway");
+    let agents_dir = gateway_dir.join("agents");
+    mkdirp(&agents_dir)?;
+    let gateway_socket_host = gateway_dir.join("gateway.sock");
+    let gateway_log_path = gateway_dir.join("gateway.log");
+
+    let mut token_by_agent = HashMap::new();
+    for agent in selected_agents {
+        token_by_agent.insert(agent.name.clone(), random_bearer_token());
+    }
+
+    let mut start_agents = vec![];
+    for agent in selected_agents {
+        let a2a = agent.a2a.clone().unwrap_or_default();
+        start_agents.push(GatewayStartAgent {
+            name: agent.name.clone(),
+            serve: a2a.serve,
+            description: a2a.description,
+            skills: a2a.skills,
+            streaming: a2a.streaming.unwrap_or(false),
+            socket_path: agents_dir.join(format!("{}.sock", agent.name)),
+        });
+    }
+
+    let mut peers_json_by_agent = HashMap::new();
+    for agent in selected_agents {
+        let peers = start_agents
+            .iter()
+            .filter(|peer| peer.serve)
+            .map(|peer| {
+                (
+                    peer.name.clone(),
+                    json!({
+                        "base_url": format!("{A2A_GATEWAY_BASE_URL}/v1/agents/{}", peer.name),
+                        "card_url": format!("{A2A_GATEWAY_BASE_URL}/v1/agents/{}/.well-known/agent-card.json", peer.name),
+                        "streaming": peer.streaming,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        peers_json_by_agent.insert(agent.name.clone(), Value::Object(peers).to_string());
+    }
+
+    let token_path = gateway_dir.join("tokens.json");
+    let token_value = Value::Object(
+        token_by_agent
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect(),
+    );
+    write_json(&token_path, &token_value)?;
+
+    Ok(Some(GatewayRunContext {
+        config,
+        gateway_dir,
+        gateway_socket_host,
+        gateway_log_path,
+        token_by_agent,
+        peers_json_by_agent,
+        start_agents,
+    }))
+}
+
+fn stop_gateway(
+    gateway_handle: Option<&mut GatewayHandle>,
+    fallback: Option<&GatewayTelemetry>,
+) -> Result<Option<GatewayTelemetry>> {
+    let Some(handle) = gateway_handle else {
+        return Ok(fallback.cloned());
+    };
+    let telemetry = handle.stop()?;
+    Ok(Some(telemetry))
+}
+
 struct PrepareContext<'a> {
     run_id: &'a str,
     run_dir: &'a Path,
@@ -2026,6 +2221,7 @@ struct PrepareContext<'a> {
     base_ref: &'a str,
     defaults: &'a SpecDefaults,
     global_image: &'a str,
+    gateway: Option<GatewayPrepareContext<'a>>,
 }
 
 fn prepare_agent(
@@ -2091,6 +2287,34 @@ fn prepare_agent(
     env_map.insert("RUN_ID".to_string(), ctx.run_id.to_string());
     env_map.insert("AGENT_BRANCH".to_string(), branch.clone());
     env_map.insert("AGENT_BASE_REF".to_string(), agent_base_ref.clone());
+    let mut gateway_dir = None;
+    if let Some(gateway) = &ctx.gateway {
+        let token = gateway
+            .token_by_agent
+            .get(&agent.name)
+            .ok_or_else(|| anyhow!("missing A2A token for agent {}", agent.name))?;
+        let peers_json = gateway
+            .peers_json_by_agent
+            .get(&agent.name)
+            .ok_or_else(|| anyhow!("missing A2A peers payload for agent {}", agent.name))?;
+
+        env_map.insert(
+            "NORMIES_A2A_GATEWAY_SOCKET".to_string(),
+            A2A_GATEWAY_SOCKET_MOUNT.to_string(),
+        );
+        env_map.insert(
+            "NORMIES_A2A_GATEWAY_BASE_URL".to_string(),
+            A2A_GATEWAY_BASE_URL.to_string(),
+        );
+        env_map.insert("NORMIES_A2A_AGENT_ID".to_string(), agent.name.clone());
+        env_map.insert(
+            "NORMIES_A2A_AGENT_SOCKET".to_string(),
+            format!("/gateway/agents/{}.sock", agent.name),
+        );
+        env_map.insert("NORMIES_A2A_TOKEN".to_string(), token.clone());
+        env_map.insert("NORMIES_A2A_PEERS_JSON".to_string(), peers_json.clone());
+        gateway_dir = Some(gateway.gateway_dir.to_path_buf());
+    }
     for (k, v) in &agent.env {
         env_map.insert(k.clone(), v.clone());
     }
@@ -2122,6 +2346,7 @@ fn prepare_agent(
         pids_limit,
         container_name,
         env_map,
+        gateway_dir,
     })
 }
 
@@ -2272,6 +2497,7 @@ fn execute_agent(agent: PreparedAgent) -> Result<AgentState> {
         pids_limit: agent.pids_limit,
         needs_network: agent.needs_network,
         read_only_rootfs: agent.read_only_rootfs,
+        gateway_dir: agent.gateway_dir.clone(),
     })?;
 
     let exit_code = run_logged(&docker_cmd, &agent.log_path, None)?;

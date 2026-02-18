@@ -16,6 +16,12 @@ review:
   required_checks:
     - "git diff --check"
 
+# Optional per-run Host A2A gateway:
+# a2a_gateway:
+#   enabled: true
+#   transport: uds
+#   auth: bearer
+
 agents:
   - name: format-check
     cmd: |
@@ -26,3 +32,12 @@ agents:
     cmd: |
       printf "\nRun: $RUN_ID\n" >> AGENT_RUN_NOTE.txt
       echo '{"status":"ok","summary":"added AGENT_RUN_NOTE.txt update","checks":[],"artifacts":[]}' > /out/result.json
+    # Optional agent A2A metadata:
+    # a2a:
+    #   serve: true
+    #   description: note-writer agent
+    #   streaming: true
+    #   skills:
+    #     - id: notes.append
+    #       name: Append Note
+    #       description: Append run notes into AGENT_RUN_NOTE.txt

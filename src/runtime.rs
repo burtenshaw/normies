@@ -131,6 +131,7 @@ pub fn run_logged(cmd: &[String], logfile: &Path, cwd: Option<&Path>) -> Result<
 
 fn run_fake_docker(cmd: &[String], logfile: &Path) -> Result<i32> {
     let mut worktree: Option<String> = None;
+    let mut gateway: Option<String> = None;
     let mut env_map: HashMap<String, String> = HashMap::new();
     let mut i = 0usize;
     while i < cmd.len() {
@@ -138,6 +139,8 @@ fn run_fake_docker(cmd: &[String], logfile: &Path) -> Result<i32> {
             let mount = &cmd[i + 1];
             if mount.contains("dst=/work") {
                 worktree = extract_mount_src(mount);
+            } else if mount.contains("dst=/gateway") {
+                gateway = extract_mount_src(mount);
             }
         }
         if cmd[i] == "-e"
@@ -150,6 +153,9 @@ fn run_fake_docker(cmd: &[String], logfile: &Path) -> Result<i32> {
     }
 
     let worktree = worktree.ok_or_else(|| anyhow!("fake docker runner expected /work mount"))?;
+    if let Some(gateway_src) = gateway {
+        rewrite_fake_gateway_env(&mut env_map, Path::new(&gateway_src));
+    }
     let shell_cmd = cmd
         .last()
         .ok_or_else(|| anyhow!("fake docker command missing shell payload"))?
@@ -161,6 +167,22 @@ fn run_fake_docker(cmd: &[String], logfile: &Path) -> Result<i32> {
         Some(Path::new(&worktree)),
         Some(&env_map),
     )
+}
+
+fn rewrite_fake_gateway_env(env_map: &mut HashMap<String, String>, gateway_src: &Path) {
+    let mut rewrite = |key: &str| {
+        let Some(current) = env_map.get(key).cloned() else {
+            return;
+        };
+        let Some(suffix) = current.strip_prefix("/gateway/") else {
+            return;
+        };
+        let host_path = gateway_src.join(suffix);
+        env_map.insert(key.to_string(), host_path.to_string_lossy().to_string());
+    };
+
+    rewrite("NORMIES_A2A_GATEWAY_SOCKET");
+    rewrite("NORMIES_A2A_AGENT_SOCKET");
 }
 
 fn extract_mount_src(mount: &str) -> Option<String> {
@@ -302,8 +324,42 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
         }
     }
 
+    if let Some(gateway) = &spec.a2a_gateway {
+        if gateway.transport.trim().is_empty() {
+            bail!("a2a_gateway.transport cannot be empty");
+        }
+        if !gateway.transport.eq_ignore_ascii_case("uds") {
+            bail!(
+                "a2a_gateway.transport '{}' is not supported; only 'uds' is currently supported",
+                gateway.transport
+            );
+        }
+        if gateway.auth.trim().is_empty() {
+            bail!("a2a_gateway.auth cannot be empty");
+        }
+        if !gateway.auth.eq_ignore_ascii_case("bearer") {
+            bail!(
+                "a2a_gateway.auth '{}' is not supported; only 'bearer' is currently supported",
+                gateway.auth
+            );
+        }
+        if gateway.bind_timeout_ms == 0 {
+            bail!("a2a_gateway.bind_timeout_ms must be > 0");
+        }
+        if gateway.request_timeout_ms == 0 {
+            bail!("a2a_gateway.request_timeout_ms must be > 0");
+        }
+        if gateway.stream_idle_timeout_ms == 0 {
+            bail!("a2a_gateway.stream_idle_timeout_ms must be > 0");
+        }
+        if gateway.max_payload_bytes == 0 {
+            bail!("a2a_gateway.max_payload_bytes must be > 0");
+        }
+    }
+
     let name_re = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]*$").expect("valid regex");
     let mut names = HashSet::new();
+    let mut serving_agents = 0usize;
     for agent in &spec.agents {
         if agent.name.trim().is_empty() {
             bail!("agent.name is required");
@@ -368,6 +424,79 @@ pub fn validate_spec(spec: &Spec) -> Result<()> {
                 );
             }
         }
+        if let Some(a2a) = &agent.a2a {
+            if a2a.serve {
+                serving_agents += 1;
+            }
+            if let Some(description) = &a2a.description
+                && description.trim().is_empty()
+            {
+                bail!("agent.a2a.description cannot be empty for {}", agent.name);
+            }
+
+            let mut skill_ids = HashSet::new();
+            for skill in &a2a.skills {
+                if skill.id.trim().is_empty() {
+                    bail!("agent.a2a.skills.id cannot be empty for {}", agent.name);
+                }
+                if !name_re.is_match(&skill.id) {
+                    bail!(
+                        "agent.a2a.skills.id '{}' contains invalid characters for {}",
+                        skill.id,
+                        agent.name
+                    );
+                }
+                if !skill_ids.insert(skill.id.clone()) {
+                    bail!(
+                        "duplicate agent.a2a.skills.id '{}' for {}",
+                        skill.id,
+                        agent.name
+                    );
+                }
+                if skill.name.trim().is_empty() {
+                    bail!(
+                        "agent.a2a.skills.name cannot be empty for {} ({})",
+                        agent.name,
+                        skill.id
+                    );
+                }
+                if skill.description.trim().is_empty() {
+                    bail!(
+                        "agent.a2a.skills.description cannot be empty for {} ({})",
+                        agent.name,
+                        skill.id
+                    );
+                }
+                for tag in &skill.tags {
+                    if tag.trim().is_empty() {
+                        bail!(
+                            "agent.a2a.skills.tags cannot contain empty values for {} ({})",
+                            agent.name,
+                            skill.id
+                        );
+                    }
+                }
+                for example in &skill.examples {
+                    if example.trim().is_empty() {
+                        bail!(
+                            "agent.a2a.skills.examples cannot contain empty values for {} ({})",
+                            agent.name,
+                            skill.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if spec
+        .a2a_gateway
+        .as_ref()
+        .map(|cfg| cfg.enabled)
+        .unwrap_or(false)
+        && serving_agents == 0
+    {
+        bail!("a2a_gateway.enabled=true requires at least one agent with a2a.serve=true");
     }
 
     Ok(())
@@ -614,6 +743,13 @@ pub fn docker_command(opts: DockerCmdOptions) -> Result<Vec<String>> {
             opts.out_dir.canonicalize()?.to_string_lossy()
         ),
     ];
+    if let Some(gateway_dir) = &opts.gateway_dir {
+        cmd.push("--mount".to_string());
+        cmd.push(format!(
+            "type=bind,src={},dst=/gateway",
+            gateway_dir.canonicalize()?.to_string_lossy()
+        ));
+    }
     if !opts.needs_network {
         cmd.push("--network".to_string());
         cmd.push("none".to_string());
@@ -895,6 +1031,7 @@ pub struct DockerCmdOptions {
     pub pids_limit: i64,
     pub needs_network: bool,
     pub read_only_rootfs: bool,
+    pub gateway_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -927,5 +1064,75 @@ mod tests {
         };
         let err = validate_spec(&spec).expect_err("expected schema validation to fail");
         assert!(err.to_string().contains("unsupported schema_version"));
+    }
+
+    #[test]
+    fn reject_non_uds_gateway_transport() {
+        let spec: Spec = serde_json::from_value(json!({
+            "schema_version": CURRENT_SPEC_VERSION,
+            "a2a_gateway": {
+                "enabled": true,
+                "transport": "tcp"
+            },
+            "agents": [
+                {
+                    "name": "agent-1",
+                    "cmd": "echo ok",
+                    "a2a": { "serve": true }
+                }
+            ]
+        }))
+        .expect("spec");
+        let err = validate_spec(&spec).expect_err("expected transport validation to fail");
+        assert!(
+            err.to_string()
+                .contains("only 'uds' is currently supported")
+        );
+    }
+
+    #[test]
+    fn reject_enabled_gateway_without_serving_agent() {
+        let spec: Spec = serde_json::from_value(json!({
+            "schema_version": CURRENT_SPEC_VERSION,
+            "a2a_gateway": {
+                "enabled": true
+            },
+            "agents": [
+                {
+                    "name": "agent-1",
+                    "cmd": "echo ok",
+                    "a2a": { "serve": false }
+                }
+            ]
+        }))
+        .expect("spec");
+        let err = validate_spec(&spec).expect_err("expected serving agent validation to fail");
+        assert!(
+            err.to_string()
+                .contains("a2a_gateway.enabled=true requires at least one agent")
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_agent_skill_ids() {
+        let spec: Spec = serde_json::from_value(json!({
+            "schema_version": CURRENT_SPEC_VERSION,
+            "agents": [
+                {
+                    "name": "agent-1",
+                    "cmd": "echo ok",
+                    "a2a": {
+                        "serve": true,
+                        "skills": [
+                            {"id": "skill-1", "name": "s1", "description": "one"},
+                            {"id": "skill-1", "name": "s2", "description": "two"}
+                        ]
+                    }
+                }
+            ]
+        }))
+        .expect("spec");
+        let err = validate_spec(&spec).expect_err("expected duplicate skill id validation to fail");
+        assert!(err.to_string().contains("duplicate agent.a2a.skills.id"));
     }
 }
