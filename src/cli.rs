@@ -132,6 +132,12 @@ pub struct InitArgs {
     pub template: String,
     #[arg(long, action = ArgAction::SetTrue)]
     pub yes: bool,
+    #[arg(long = "agent-context", value_delimiter = ',')]
+    pub agent_context: Vec<String>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

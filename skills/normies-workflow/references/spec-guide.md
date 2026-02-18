@@ -104,6 +104,23 @@ normies make-spec \
   --network-agent deps
 ```
 
+Initialize a baseline spec and scaffold AGENTS/Claude guidance:
+
+```bash
+normies init \
+  --yes \
+  --template baseline \
+  --output normies.spec.json \
+  --repo . \
+  --agent-context codex,claude
+```
+
+Force replace an unmanaged Claude skill scaffold:
+
+```bash
+normies init --yes --output normies.spec.json --agent-context claude --force
+```
+
 ## Troubleshooting
 
 - `docker daemon is not available`: start Docker before `normies run`.

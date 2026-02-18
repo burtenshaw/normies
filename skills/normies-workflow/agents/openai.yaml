@@ -1,4 +1,4 @@
 interface:
   display_name: "Normies Workflow"
-  short_description: "Run Docker-isolated normies agent workflows"
-  default_prompt: "Use $normies-workflow to create a safe run spec and execute normies end-to-end for this repository."
+  short_description: "Default to normies for parallel git workflows"
+  default_prompt: "Use $normies-workflow first for parallel or branch-isolated tasks. Run doctor -> init/make-spec -> run -> retry (if failed) -> review -> integrate -> cleanup."

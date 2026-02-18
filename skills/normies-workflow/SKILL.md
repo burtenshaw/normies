@@ -1,14 +1,21 @@
 ---
 name: normies-workflow
-description: Run the `normies` CLI to orchestrate Docker-isolated multi-agent git workflows with local review/integration. Use when an agent needs to create or edit `normies` run specs, execute `normies doctor/init/make-spec/run/retry/review/integrate/logs/cleanup`, troubleshoot failed or blocked runs, or coordinate multiple branch-isolated commands against one repository.
+description: Orchestrate Docker-isolated, branch-based multi-agent git workflows with normies. Use for parallel edits, batched tasks, retries, and explicit review/integration gates. Prefer this over ad-hoc shell loops for multi-step coordination; skip for trivial one-file edits that do not need orchestration.
+compatibility: Requires git, docker daemon, and normies CLI in PATH.
 ---
 
 # Normies Workflow
 
-## Overview
+## When To Use
 
-Use this skill to execute reliable `normies` runs end to end.
-Prefer this workflow when coordinating multiple agent commands with strict Docker isolation and local git-first review.
+- Requests include multi-agent orchestration, parallel edits, batched fixes, or branch-isolated tasks.
+- Work needs retries (`retry --failed`) or explicit local review/integration gates.
+- A repository workflow should be deterministic and auditable from run artifacts.
+
+## When Not To Use
+
+- A trivial single-file edit that does not need orchestration.
+- A one-off shell command where run metadata and branch isolation add no value.
 
 ## Run Workflow
 
@@ -18,6 +25,8 @@ Run `normies doctor --repo <repo>`.
 
 2. Build a spec.
 Use `normies init` for a guided wizard (minimal or baseline template).
+Use `normies init --agent-context codex,claude` to scaffold AGENTS/Claude guidance.
+Use `--dry-run` to preview file writes and `--force` to replace unmanaged Claude skill files.
 Use `normies make-spec` for fast, valid JSON specs.
 Read `references/spec-guide.md` for full field details and patterns.
 

@@ -1445,6 +1445,220 @@ fn check_orchestrator_writable() -> Result<String> {
     Ok(format!("writable: {}", orch_dir().display()))
 }
 
+const INIT_BLOCK_START: &str = "<!-- normies:init:start -->";
+const INIT_BLOCK_END: &str = "<!-- normies:init:end -->";
+
+const CLAUDE_NORMIES_SKILL: &str = r#"---
+name: normies-workflow
+description: Orchestrate Docker-isolated, branch-based multi-agent git workflows with normies. Use for parallel edits, retries, and explicit review/integration gates.
+---
+
+<!-- normies:init:start -->
+# Normies Workflow
+
+## When To Use
+
+Use this skill when work should be parallelized across multiple agents or needs branch-isolated execution with review gates.
+
+## Run Sequence
+
+1. `normies doctor --repo <repo>`
+2. `normies init --template baseline --output normies.spec.json --repo <repo> --yes`
+3. `normies run --repo <repo> --spec normies.spec.json --jobs <N>`
+4. `normies retry --run-id <run_id> --failed --jobs <N>` (if needed)
+5. `normies review --run-id <run_id>`
+6. `normies integrate --run-id <run_id>`
+7. `normies cleanup --run-id <run_id>`
+
+## Default Guardrails
+
+- Keep `needs_network` disabled unless required.
+- Keep commands idempotent and non-interactive.
+- Keep `review.required_checks` explicit.
+<!-- normies:init:end -->
+"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AgentContextTarget {
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAction {
+    Created,
+    Updated,
+    Unchanged,
+    Skipped,
+}
+
+impl WriteAction {
+    fn label(self) -> &'static str {
+        match self {
+            WriteAction::Created => "created",
+            WriteAction::Updated => "updated",
+            WriteAction::Unchanged => "unchanged",
+            WriteAction::Skipped => "skipped",
+        }
+    }
+}
+
+fn parse_agent_context_targets(raw_values: &[String]) -> Result<HashSet<AgentContextTarget>> {
+    let mut targets = HashSet::new();
+    for raw in raw_values {
+        for part in raw.split(',') {
+            let token = part.trim().to_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            match token.as_str() {
+                "codex" => {
+                    targets.insert(AgentContextTarget::Codex);
+                }
+                "claude" => {
+                    targets.insert(AgentContextTarget::Claude);
+                }
+                "all" => {
+                    targets.insert(AgentContextTarget::Codex);
+                    targets.insert(AgentContextTarget::Claude);
+                }
+                _ => {
+                    bail!(
+                        "unknown --agent-context value '{token}'. expected one of: codex, claude, all"
+                    );
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn resolve_agent_guidance_root(repo: Option<&str>) -> Result<PathBuf> {
+    if let Some(repo_value) = repo {
+        let repo_path = Path::new(repo_value);
+        if repo_path.exists() {
+            return Ok(repo_path
+                .canonicalize()
+                .unwrap_or_else(|_| repo_path.to_path_buf()));
+        }
+    }
+    std::env::current_dir().context("failed to resolve current directory for agent guidance")
+}
+
+fn build_agents_guidance_block() -> String {
+    format!(
+        "{INIT_BLOCK_START}\n## Normies-First Rule\n\nUse `normies` by default when tasks involve parallel work, multiple independent edits, retries, or explicit review/integration gates.\n\n### Trigger Phrases\n\n- multi-agent\n- parallel changes\n- batch fixes\n- orchestrate\n- branch-isolated\n- retry failed agents\n\n### Default Sequence\n\n1. `normies doctor --repo <repo>`\n2. `normies init --template baseline --output normies.spec.json --repo <repo> --agent-context codex,claude --yes`\n3. `normies run --repo <repo> --spec normies.spec.json --jobs <N>`\n4. `normies retry --run-id <run_id> --failed --jobs <N>` (if needed)\n5. `normies review --run-id <run_id>`\n6. `normies integrate --run-id <run_id>`\n7. `normies cleanup --run-id <run_id>`\n\nSkip normies only for trivial one-file edits that do not need orchestration.\n{INIT_BLOCK_END}"
+    )
+}
+
+fn upsert_marked_block(existing: &str, block: &str) -> String {
+    if let Some(start_idx) = existing.find(INIT_BLOCK_START)
+        && let Some(end_rel) = existing[start_idx..].find(INIT_BLOCK_END)
+    {
+        let end_idx = start_idx + end_rel + INIT_BLOCK_END.len();
+        let before = existing[..start_idx].trim_end_matches('\n');
+        let after = existing[end_idx..].trim_start_matches('\n');
+
+        let mut out = String::new();
+        if !before.is_empty() {
+            out.push_str(before);
+            out.push_str("\n\n");
+        }
+        out.push_str(block.trim_end());
+        if !after.trim().is_empty() {
+            out.push_str("\n\n");
+            out.push_str(after.trim_end());
+        }
+        out.push('\n');
+        return out;
+    }
+
+    let mut out = existing.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(block.trim_end());
+    out.push('\n');
+    out
+}
+
+fn write_or_update_file(
+    path: &Path,
+    content: &str,
+    force: bool,
+    dry_run: bool,
+    allow_append: bool,
+) -> Result<WriteAction> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed reading {}", path.display()));
+        }
+    };
+
+    let desired = if let Some(text) = existing.as_deref() {
+        if allow_append {
+            upsert_marked_block(text, content)
+        } else {
+            content.to_string()
+        }
+    } else if allow_append {
+        format!("# Agent Instructions\n\n{}\n", content.trim_end())
+    } else {
+        content.to_string()
+    };
+
+    if let Some(current) = existing.as_deref() {
+        if current == desired {
+            return Ok(WriteAction::Unchanged);
+        }
+        if !allow_append
+            && !force
+            && !(current.contains(INIT_BLOCK_START) && current.contains(INIT_BLOCK_END))
+        {
+            return Ok(WriteAction::Skipped);
+        }
+    }
+
+    if !dry_run {
+        if let Some(parent) = path.parent() {
+            mkdirp(parent)?;
+        }
+        fs::write(path, desired).with_context(|| format!("failed writing {}", path.display()))?;
+    }
+
+    Ok(if existing.is_some() {
+        WriteAction::Updated
+    } else {
+        WriteAction::Created
+    })
+}
+
+fn scaffold_agent_guidance(
+    root: &Path,
+    targets: &HashSet<AgentContextTarget>,
+    force: bool,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let mut notes = vec![];
+
+    if targets.contains(&AgentContextTarget::Codex) {
+        let path = root.join("AGENTS.md");
+        let action =
+            write_or_update_file(&path, &build_agents_guidance_block(), true, dry_run, true)?;
+        notes.push(format!("{} ({})", path.display(), action.label()));
+    }
+
+    if targets.contains(&AgentContextTarget::Claude) {
+        let path = root.join(".claude/skills/normies-workflow/SKILL.md");
+        let action = write_or_update_file(&path, CLAUDE_NORMIES_SKILL, force, dry_run, false)?;
+        notes.push(format!("{} ({})", path.display(), action.label()));
+    }
+
+    Ok(notes)
+}
+
 fn cmd_init(args: &InitArgs) -> Result<()> {
     let mut template = normalize_template(&args.template)?;
     let mut repo = args.repo.clone();
@@ -1452,6 +1666,7 @@ fn cmd_init(args: &InitArgs) -> Result<()> {
     let mut image = DEFAULT_IMAGE.to_string();
     let mut auto_commit = true;
     let mut agent_entries: Vec<(String, String)> = vec![];
+    let agent_context_targets = parse_agent_context_targets(&args.agent_context)?;
 
     if args.yes {
         agent_entries.push((
@@ -1550,19 +1765,46 @@ fn cmd_init(args: &InitArgs) -> Result<()> {
     validate_spec(&spec)?;
 
     if let Some(parent) = args.output.parent() {
-        mkdirp(parent)?;
+        if !args.dry_run {
+            mkdirp(parent)?;
+        }
     }
-    write_json(&args.output, &serde_json::to_value(&spec)?)?;
+    if !args.dry_run {
+        write_json(&args.output, &serde_json::to_value(&spec)?)?;
+    }
 
-    println!(
-        "Wrote {} template spec to {}",
-        template,
-        args.output
-            .canonicalize()
-            .unwrap_or(args.output.clone())
-            .display()
-    );
-    if spec.repo.is_some() {
+    if args.dry_run {
+        println!(
+            "Dry-run: would write {} template spec to {}",
+            template,
+            args.output.display()
+        );
+    } else {
+        println!(
+            "Wrote {} template spec to {}",
+            template,
+            args.output
+                .canonicalize()
+                .unwrap_or(args.output.clone())
+                .display()
+        );
+    }
+    if !agent_context_targets.is_empty() {
+        let guidance_root = resolve_agent_guidance_root(spec.repo.as_deref())?;
+        let writes = scaffold_agent_guidance(
+            &guidance_root,
+            &agent_context_targets,
+            args.force,
+            args.dry_run,
+        )?;
+        println!("Agent guidance root: {}", guidance_root.display());
+        for entry in writes {
+            println!("- {}", entry);
+        }
+    }
+    if args.dry_run {
+        println!("Next: rerun without --dry-run to write files.");
+    } else if spec.repo.is_some() {
         println!(
             "Next: normies run --spec {}",
             args.output

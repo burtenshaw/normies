@@ -263,6 +263,92 @@ fn make_spec_supports_no_auto_commit() {
 }
 
 #[test]
+fn init_agent_context_scaffolds_codex_and_claude_files() {
+    let tmp = TempDir::new().expect("tempdir");
+    let spec_path = tmp.path().join("normies.spec.json");
+
+    normies_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "init",
+            "--yes",
+            "--template",
+            "baseline",
+            "--output",
+            spec_path.to_string_lossy().as_ref(),
+            "--agent-context",
+            "codex,claude",
+        ])
+        .assert()
+        .success();
+
+    assert!(spec_path.exists(), "expected spec output file");
+    let agents_md = tmp.path().join("AGENTS.md");
+    assert!(agents_md.exists(), "expected AGENTS.md scaffold");
+    let claude_skill = tmp.path().join(".claude/skills/normies-workflow/SKILL.md");
+    assert!(claude_skill.exists(), "expected Claude skill scaffold");
+
+    let agents_text = fs::read_to_string(&agents_md).expect("read AGENTS.md");
+    assert!(
+        agents_text.contains("Normies-First Rule"),
+        "expected normies guidance in AGENTS.md: {agents_text}"
+    );
+    let claude_text = fs::read_to_string(&claude_skill).expect("read Claude SKILL.md");
+    assert!(
+        claude_text.contains("name: normies-workflow"),
+        "expected normies metadata in Claude SKILL.md: {claude_text}"
+    );
+}
+
+#[test]
+fn init_agent_context_dry_run_does_not_write_files() {
+    let tmp = TempDir::new().expect("tempdir");
+    let spec_path = tmp.path().join("normies.spec.json");
+
+    normies_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "init",
+            "--yes",
+            "--output",
+            spec_path.to_string_lossy().as_ref(),
+            "--agent-context",
+            "codex",
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+
+    assert!(!spec_path.exists(), "expected no spec file on dry-run");
+    assert!(
+        !tmp.path().join("AGENTS.md").exists(),
+        "expected no AGENTS.md on dry-run"
+    );
+}
+
+#[test]
+fn init_agent_context_rejects_unknown_value() {
+    let tmp = TempDir::new().expect("tempdir");
+    let out = normies_cmd()
+        .current_dir(tmp.path())
+        .args(["init", "--yes", "--agent-context", "unknown-target"])
+        .output()
+        .expect("init should start");
+
+    assert!(
+        !out.status.success(),
+        "expected init failure for unknown context\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown --agent-context value"),
+        "expected unknown context error in stderr: {stderr}"
+    );
+}
+
+#[test]
 fn review_uses_latest_when_run_id_is_omitted() {
     let tmp = TempDir::new().expect("tempdir");
     let repo = init_repo(&tmp);

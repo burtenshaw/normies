@@ -113,6 +113,29 @@ Non-interactive init:
 normies init --yes --template baseline --output normies.spec.json --repo owner/repo
 ```
 
+Scaffold agent guidance for Codex + Claude while initializing:
+
+```bash
+normies init \
+  --yes \
+  --template baseline \
+  --output normies.spec.json \
+  --repo . \
+  --agent-context codex,claude
+```
+
+Preview generated files without writing:
+
+```bash
+normies init --yes --output normies.spec.json --agent-context codex --dry-run
+```
+
+Replace an existing unmanaged Claude skill file:
+
+```bash
+normies init --yes --output normies.spec.json --agent-context claude --force
+```
+
 ## Testing
 
 ```bash
