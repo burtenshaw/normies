@@ -5,14 +5,14 @@
 - Agents run as independent Docker containers.
 - Each agent uses an isolated git branch and worktree.
 - Review and integration happen locally.
-- Final publishing can push a branch and optionally open a PR.
+- You can push integrated branches yourself and open PRs from your normal git workflow.
+- Human-readable output is default; use `--json` for machine output.
 
 ## Requirements
 
 - `git`
 - `docker` (daemon running and reachable)
 - `rustup` / `cargo` (Rust 1.93+)
-- `gh` (optional, only for `publish --final-pr`)
 
 ## Build
 
@@ -36,11 +36,49 @@ normies --help
 ## Quick Start
 
 ```bash
-normies run --repo <git-url-or-local-path> --spec examples/spec.yaml
+normies doctor --repo <git-url-or-local-path>
+normies run --repo <git-url-or-local-path> --spec examples/spec.yaml --jobs 2
 normies status
-normies review --run-id <run_id>
-normies integrate --run-id <run_id>
-normies publish --run-id <run_id>
+normies review --latest
+normies integrate --latest
+```
+
+Push the integrated branch when you are ready:
+
+```bash
+# get hub_path + integration_branch
+normies status --run-id <run_id>
+
+# then push that branch yourself
+git --git-dir <hub_path> push origin <integration_branch>
+```
+
+Codex-friendly merge handoff is written during integration:
+
+```bash
+normies integrate --run-id <run_id> --json
+# inspect codex.handoff_markdown_path and codex.fetch_integration_branch
+```
+
+Status JSON now includes worktree transparency metadata:
+
+```bash
+normies status --run-id <run_id> --json
+# includes run_dir, manifest_path, and worktree_status for integration + agents
+```
+
+Retry only failed agents:
+
+```bash
+normies retry --run-id <run_id> --failed --jobs 2
+```
+
+Inspect logs:
+
+```bash
+normies logs --latest --list-agents
+normies logs --latest --agent <agent_name> --tail 200
+normies logs --latest --agent <agent_name> --follow
 ```
 
 Generate a JSON spec:
@@ -52,6 +90,27 @@ normies make-spec \
   --agent "lint::npm ci && npm run lint" \
   --agent "test::npm test" \
   --check "git diff --check"
+```
+
+Disable auto-commit in generated specs:
+
+```bash
+normies make-spec \
+  --output /tmp/normies-spec.json \
+  --agent "lint::npm ci && npm run lint" \
+  --no-auto-commit
+```
+
+Initialize a spec with the wizard:
+
+```bash
+normies init
+```
+
+Non-interactive init:
+
+```bash
+normies init --yes --template baseline --output normies.spec.json --repo owner/repo
 ```
 
 ## Testing

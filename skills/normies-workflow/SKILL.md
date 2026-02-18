@@ -1,6 +1,6 @@
 ---
 name: normies-workflow
-description: Run the `normies` CLI to orchestrate Docker-isolated multi-agent git workflows with local review/integration and optional final PR publication. Use when an agent needs to create or edit `normies` run specs, execute `normies run/review/integrate/publish/cleanup`, troubleshoot failed or blocked runs, or coordinate multiple branch-isolated commands against one repository.
+description: Run the `normies` CLI to orchestrate Docker-isolated multi-agent git workflows with local review/integration. Use when an agent needs to create or edit `normies` run specs, execute `normies doctor/init/make-spec/run/retry/review/integrate/logs/cleanup`, troubleshoot failed or blocked runs, or coordinate multiple branch-isolated commands against one repository.
 ---
 
 # Normies Workflow
@@ -14,25 +14,29 @@ Prefer this workflow when coordinating multiple agent commands with strict Docke
 
 1. Confirm prerequisites.
 Check `normies --help`.
-Check `docker info`.
+Run `normies doctor --repo <repo>`.
 
 2. Build a spec.
+Use `normies init` for a guided wizard (minimal or baseline template).
 Use `normies make-spec` for fast, valid JSON specs.
 Read `references/spec-guide.md` for full field details and patterns.
 
 3. Execute the pipeline.
-Run `normies run --repo <repo> --spec <spec>`.
-Run `normies review --run-id <run_id>`.
-Run `normies integrate --run-id <run_id>`.
-Run `normies publish --run-id <run_id>` and add `--final-pr` only when remote PR creation is required.
+Run `normies run --repo <repo> --spec <spec> --jobs <N>`.
+Run `normies retry --run-id <run_id> --failed --jobs <N>` if any agents failed.
+Run `normies review --latest` (or `--run-id <run_id>`).
+Run `normies integrate --latest` (or `--run-id <run_id>`).
+Use the printed push command from integrate output to push manually.
 
 4. Triage failures.
-Run `normies status --run-id <run_id>`.
-Run `normies logs --run-id <run_id> --agent <agent_name>`.
+Run `normies status --latest`.
+Run `normies logs --latest --list-agents`.
+Run `normies logs --latest --agent <agent_name> --tail 200`.
+Run `normies logs --latest --agent <agent_name> --follow` for live logs.
 Inspect `.orchestrator/runs/<run_id>/run.json` for full per-agent state.
 
 5. Clean up worktrees after completion.
-Run `normies cleanup --run-id <run_id>`.
+Run `normies cleanup --latest`.
 Add `--remove-run-dir` when you also want to remove run metadata and artifacts.
 
 ## Execution Defaults
@@ -41,6 +45,7 @@ Add `--remove-run-dir` when you also want to remove run metadata and artifacts.
 - Keep `auto_commit` enabled unless explicit manual commit behavior is needed.
 - Keep per-agent commands idempotent and non-interactive.
 - Keep review checks explicit in `review.required_checks`.
+- Use `--json` when output is consumed by scripts/automation.
 
 ## Status Interpretation
 
