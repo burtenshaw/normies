@@ -653,12 +653,11 @@ fn run_with_a2a_gateway_exposes_metadata_and_injects_env() {
     let gateway = run_json
         .get("gateway")
         .expect("gateway metadata in run json");
-    assert_eq!(
+    assert!(
         gateway
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        true,
         "expected gateway.enabled=true: {run_json}"
     );
     let socket_path = gateway
@@ -705,5 +704,132 @@ fn run_with_a2a_gateway_exposes_metadata_and_injects_env() {
     assert!(
         !token_value.trim().is_empty(),
         "expected non-empty gateway token in injected env"
+    );
+}
+
+#[test]
+fn run_injects_subagent_context_from_agents_and_skills() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = init_repo(&tmp);
+
+    fs::write(
+        repo.join("AGENTS.md"),
+        "# Agent Instructions\n\nRoot guidance.\n",
+    )
+    .expect("write AGENTS");
+    fs::create_dir_all(repo.join("nested")).expect("create nested dir");
+    fs::write(
+        repo.join("nested").join("AGENTS.md"),
+        "# Nested Instructions\n\nNested guidance.\n",
+    )
+    .expect("write nested AGENTS");
+    fs::create_dir_all(repo.join("skills").join("repo-helper")).expect("create skill dir");
+    fs::write(
+        repo.join("skills").join("repo-helper").join("SKILL.md"),
+        "---\nname: repo-helper\ndescription: Repository helper skill.\n---\n\nUse this skill for repo tasks.\n",
+    )
+    .expect("write skill");
+    git(
+        &repo,
+        &[
+            "add",
+            "AGENTS.md",
+            "nested/AGENTS.md",
+            "skills/repo-helper/SKILL.md",
+        ],
+    );
+    git(&repo, &["commit", "-m", "add agent guidance"]);
+
+    let spec_path = tmp.path().join("spec.json");
+    fs::write(
+        &spec_path,
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "base_ref": "main",
+            "agents": [
+                {
+                    "name": "subagent-aware",
+                    "cmd": "printf '%s\\n' \"$CODEX_HOME\" > CODEX_HOME.txt\ncp AGENTS.md SEEN_AGENTS.md\ncp \"$NORMIES_SUBAGENT_CONTEXT_JSON\" SUBAGENT_CONTEXT.json\ntest -f \"$CODEX_HOME/skills/repo-helper/SKILL.md\"\ngrep -q \"Subagent Context\" SEEN_AGENTS.md\ngrep -q \"nested/AGENTS.md\" SEEN_AGENTS.md\ngrep -q \"repo-helper\" SEEN_AGENTS.md\ngrep -q '\"runtime\":\"codex\"' SUBAGENT_CONTEXT.json\ngrep -q 'nested/AGENTS.md' SUBAGENT_CONTEXT.json\n"
+                }
+            ]
+        }))
+        .expect("serialize spec"),
+    )
+    .expect("write spec");
+
+    let run_id = "run-subagent-context-001";
+    normies_cmd()
+        .current_dir(tmp.path())
+        .env("NORMIES_TEST_FAKE_DOCKER", "1")
+        .args([
+            "run",
+            "--repo",
+            repo.to_string_lossy().as_ref(),
+            "--spec",
+            spec_path.to_string_lossy().as_ref(),
+            "--run-id",
+            run_id,
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let status = read_status(&tmp, run_id);
+    let agent = status
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .expect("first agent");
+    let worktree = PathBuf::from(
+        agent
+            .get("worktree")
+            .and_then(serde_json::Value::as_str)
+            .expect("agent worktree path"),
+    );
+    let worktree = if worktree.is_absolute() {
+        worktree
+    } else {
+        tmp.path().join(worktree)
+    };
+
+    let seen_agents =
+        fs::read_to_string(worktree.join("SEEN_AGENTS.md")).expect("read seen AGENTS overlay");
+    assert!(
+        seen_agents.contains("Subagent Context"),
+        "expected injected subagent block: {seen_agents}"
+    );
+    assert!(
+        seen_agents.contains("repo-helper"),
+        "expected discovered skill in AGENTS overlay: {seen_agents}"
+    );
+    assert!(
+        seen_agents.contains("nested/AGENTS.md"),
+        "expected nested AGENTS path in overlay: {seen_agents}"
+    );
+
+    let codex_home = fs::read_to_string(worktree.join("CODEX_HOME.txt")).expect("read CODEX_HOME");
+    assert!(
+        codex_home.trim().contains("codex-home"),
+        "expected mounted codex home path: {codex_home}"
+    );
+
+    let context_json = fs::read_to_string(
+        tmp.path()
+            .join(".orchestrator")
+            .join("runs")
+            .join(run_id)
+            .join("agents")
+            .join("subagent-aware")
+            .join("subagent-context")
+            .join("subagent-context.json"),
+    )
+    .expect("read generated subagent context");
+    assert!(
+        context_json.contains("\"repo-helper\""),
+        "expected skill in subagent context json: {context_json}"
+    );
+    assert!(
+        context_json.contains("nested/AGENTS.md"),
+        "expected nested AGENTS in subagent context json: {context_json}"
     );
 }

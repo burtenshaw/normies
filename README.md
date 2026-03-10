@@ -81,6 +81,35 @@ normies logs --latest --agent <agent_name> --tail 200
 normies logs --latest --agent <agent_name> --follow
 ```
 
+## Example Challenge
+
+```
+  Proposal: "Parallel Full-Stack App Assembly"
+                                                                                                                                                                                                                                                                     
+  Build a complete task management web app from scratch using 8 parallel normies agents, each writing a different layer of the stack simultaneously. The integrated result should be a working application.
+
+  ┌────────────┬──────────────┬──────────────────────────────────────┐
+  │   Agent    │     Role     │               Produces               │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ schema     │ DB architect │ SQLite schema, migrations, seed data │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ api        │ Backend dev  │ Python Flask REST API                │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ auth       │ Security eng │ JWT auth middleware + user model     │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ frontend   │ UI dev       │ Single-page HTML/JS/CSS app          │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ tests-unit │ QA unit      │ pytest tests for API                 │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ tests-e2e  │ QA e2e       │ End-to-end test scripts              │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ docs       │ Tech writer  │ OpenAPI spec + README                │
+  ├────────────┼──────────────┼──────────────────────────────────────┤
+  │ devops     │ Infra        │ Dockerfile, docker-compose, Makefile │
+  └────────────┴──────────────┴──────────────────────────────────────┘
+
+```
+
 ## Host A2A Gateway (Opt-in)
 
 Enable per-run local A2A proxying with a Unix socket gateway:
@@ -188,6 +217,17 @@ Replace an existing unmanaged Claude skill file:
 ```bash
 normies init --yes --output normies.spec.json --agent-context claude --force
 ```
+
+## Subagent Context
+
+When an agent worktree contains repo guidance, `normies run` now prepares child-agent context automatically:
+
+- Root `AGENTS.md` is overlaid inside the container with a managed block that lists discovered repo `AGENTS.md` files and project skills.
+- Repo Codex skills in `skills/*/SKILL.md` or `.codex/skills/*/SKILL.md` are mirrored into a per-agent `CODEX_HOME`.
+- The full discovered context is exposed at `NORMIES_SUBAGENT_CONTEXT_JSON=/normies/subagent-context.json`.
+- Claude project skills in `.claude/skills/*/SKILL.md` stay available from the repo checkout as usual.
+
+This happens per run under `.orchestrator/runs/<run_id>/agents/<agent>/subagent-context/`, so the user repository is not modified just to launch child agents.
 
 ## Testing
 

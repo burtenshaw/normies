@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rand::Rng;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -16,17 +17,17 @@ use crate::cli::{
 };
 use crate::gateway::{GatewayHandle, GatewayStartAgent, GatewayStartOptions, start_gateway};
 use crate::models::{
-    A2aGatewayConfig, AgentSpec, AgentState, GatewayTelemetry, PreparedAgent, ReviewConfig,
-    RunManifest, Spec, SpecDefaults,
+    A2aGatewayConfig, AgentSpec, AgentState, BindMountSpec, GatewayTelemetry, PreparedAgent,
+    ReviewConfig, RunManifest, Spec, SpecDefaults,
 };
 use crate::runtime::{
     DockerCmdOptions, check_tool_exists, create_run_id, docker_command,
     ensure_agent_branch_worktree, ensure_commit_if_needed, ensure_docker_daemon, ensure_hub,
     ensure_orch_dirs, fake_docker_mode, git_dir_cmd, git_head, git_is_dirty, list_runs, load_spec,
     mkdirp, normalize_repo_input, normalized_result, now_iso, orch_dir, parse_agent_entry,
-    print_json, read_result_json, remove_worktree_if_exists, repo_from_manifest, resolve_ref,
-    run_cmd, run_local_checks, run_logged, runs_dir, sanitize_container_name, sanitize_repo_key,
-    save_manifest, validate_spec, write_json,
+    print_json, read_result_json, refresh_hub_if_needed, remove_worktree_if_exists,
+    repo_from_manifest, resolve_ref, run_cmd, run_local_checks, run_logged, runs_dir,
+    sanitize_container_name, sanitize_repo_key, save_manifest, validate_spec, write_json,
 };
 
 pub fn execute(command: Commands) -> Result<()> {
@@ -77,7 +78,8 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
 
     let normalized_repo = normalize_repo_input(&repo_input)?;
     let repo_key = sanitize_repo_key(&normalized_repo);
-    let hub_path = ensure_hub(&normalized_repo, &repo_key, &base_ref)?;
+    let refs = spec_refs(&spec, &base_ref);
+    let hub_path = ensure_hub(&normalized_repo, &repo_key, &refs)?;
 
     let run_id = args.run_id.clone().unwrap_or_else(create_run_id);
     let run_dir = runs_dir().join(&run_id);
@@ -247,6 +249,8 @@ fn cmd_retry(args: &RetryArgs) -> Result<()> {
 
     let run_dir = runs_dir().join(&manifest.run_id);
     let hub_path = PathBuf::from(&manifest.hub_path);
+    let refs = spec_refs(&spec, &manifest.base_ref);
+    refresh_hub_if_needed(&manifest.repo_resolved, &hub_path, &refs)?;
     let defaults = spec.defaults.clone().unwrap_or_default();
     let global_image = spec
         .image
@@ -1521,6 +1525,10 @@ fn check_orchestrator_writable() -> Result<String> {
 
 const INIT_BLOCK_START: &str = "<!-- normies:init:start -->";
 const INIT_BLOCK_END: &str = "<!-- normies:init:end -->";
+const SUBAGENT_BLOCK_START: &str = "<!-- normies:subagents:start -->";
+const SUBAGENT_BLOCK_END: &str = "<!-- normies:subagents:end -->";
+const SUBAGENT_CONTEXT_JSON_PATH: &str = "/normies/subagent-context.json";
+const SUBAGENT_CODEX_HOME: &str = "/normies/codex-home";
 
 const CLAUDE_NORMIES_SKILL: &str = r#"---
 name: normies-workflow
@@ -1626,10 +1634,19 @@ fn build_agents_guidance_block() -> String {
 }
 
 fn upsert_marked_block(existing: &str, block: &str) -> String {
-    if let Some(start_idx) = existing.find(INIT_BLOCK_START)
-        && let Some(end_rel) = existing[start_idx..].find(INIT_BLOCK_END)
+    upsert_marked_block_between(existing, block, INIT_BLOCK_START, INIT_BLOCK_END)
+}
+
+fn upsert_marked_block_between(
+    existing: &str,
+    block: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> String {
+    if let Some(start_idx) = existing.find(start_marker)
+        && let Some(end_rel) = existing[start_idx..].find(end_marker)
     {
-        let end_idx = start_idx + end_rel + INIT_BLOCK_END.len();
+        let end_idx = start_idx + end_rel + end_marker.len();
         let before = existing[..start_idx].trim_end_matches('\n');
         let after = existing[end_idx..].trim_start_matches('\n');
 
@@ -1687,9 +1704,9 @@ fn write_or_update_file(
         if current == desired {
             return Ok(WriteAction::Unchanged);
         }
-        if !allow_append
-            && !force
-            && !(current.contains(INIT_BLOCK_START) && current.contains(INIT_BLOCK_END))
+        if !(allow_append
+            || force
+            || (current.contains(INIT_BLOCK_START) && current.contains(INIT_BLOCK_END)))
         {
             return Ok(WriteAction::Skipped);
         }
@@ -1840,10 +1857,10 @@ fn cmd_init(args: &InitArgs) -> Result<()> {
 
     validate_spec(&spec)?;
 
-    if let Some(parent) = args.output.parent() {
-        if !args.dry_run {
-            mkdirp(parent)?;
-        }
+    if let Some(parent) = args.output.parent()
+        && !args.dry_run
+    {
+        mkdirp(parent)?;
     }
     if !args.dry_run {
         write_json(&args.output, &serde_json::to_value(&spec)?)?;
@@ -2044,6 +2061,28 @@ fn latest_run_id() -> Result<String> {
     })
 }
 
+fn spec_refs(spec: &Spec, default_base_ref: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut refs = vec![];
+    let push_ref = |reference: &str, refs: &mut Vec<String>, seen: &mut HashSet<String>| {
+        let trimmed = reference.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if seen.insert(trimmed.to_string()) {
+            refs.push(trimmed.to_string());
+        }
+    };
+
+    push_ref(default_base_ref, &mut refs, &mut seen);
+    for agent in &spec.agents {
+        if let Some(base_ref) = agent.base_ref.as_deref() {
+            push_ref(base_ref, &mut refs, &mut seen);
+        }
+    }
+    refs
+}
+
 fn resolve_ref_once(
     hub_path: &Path,
     reference: &str,
@@ -2224,6 +2263,376 @@ struct PrepareContext<'a> {
     gateway: Option<GatewayPrepareContext<'a>>,
 }
 
+#[derive(Debug, Clone)]
+struct DiscoveredSkill {
+    runtime: &'static str,
+    name: String,
+    description: String,
+    relative_path: String,
+    source_dir: PathBuf,
+    mount_name: String,
+}
+
+#[derive(Debug)]
+struct PreparedSubagentContext {
+    env_map: HashMap<String, String>,
+    extra_mounts: Vec<BindMountSpec>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+fn prepare_subagent_context(
+    agent_dir: &Path,
+    worktree: &Path,
+) -> Result<Option<PreparedSubagentContext>> {
+    let agents_files = discover_named_files(worktree, "AGENTS.md")?;
+    let has_nested_agents = agents_files.iter().any(|path| path != "AGENTS.md");
+    let codex_skills = discover_skills(
+        worktree,
+        &[
+            ("codex", worktree.join(".codex").join("skills")),
+            ("codex", worktree.join("skills")),
+        ],
+    )?;
+    let claude_skills = discover_skills(
+        worktree,
+        &[("claude", worktree.join(".claude").join("skills"))],
+    )?;
+
+    if codex_skills.is_empty() && claude_skills.is_empty() && !has_nested_agents {
+        return Ok(None);
+    }
+
+    let context_dir = agent_dir.join("subagent-context");
+    mkdirp(&context_dir)?;
+
+    let block = build_subagent_agents_block(&agents_files, &codex_skills, &claude_skills);
+    let base_agents = fs::read_to_string(worktree.join("AGENTS.md")).unwrap_or_default();
+    let overlay_agents = upsert_marked_block_between(
+        &base_agents,
+        &block,
+        SUBAGENT_BLOCK_START,
+        SUBAGENT_BLOCK_END,
+    );
+    let overlay_agents = if base_agents.trim().is_empty() {
+        format!("# Agent Instructions\n\n{}", overlay_agents.trim_start())
+    } else {
+        overlay_agents
+    };
+    let overlay_agents_path = context_dir.join("AGENTS.md");
+    fs::write(&overlay_agents_path, overlay_agents)
+        .with_context(|| format!("failed to write {}", overlay_agents_path.display()))?;
+
+    let context_json_path = context_dir.join("subagent-context.json");
+    write_json(
+        &context_json_path,
+        &json!({
+            "agents_md": agents_files,
+            "skills": build_skill_manifest_entries(&codex_skills, &claude_skills),
+        }),
+    )?;
+
+    let mut env_map = HashMap::new();
+    env_map.insert(
+        "NORMIES_SUBAGENT_CONTEXT_JSON".to_string(),
+        SUBAGENT_CONTEXT_JSON_PATH.to_string(),
+    );
+
+    let mut extra_mounts = vec![
+        BindMountSpec {
+            src: overlay_agents_path,
+            dst: "/work/AGENTS.md".to_string(),
+        },
+        BindMountSpec {
+            src: context_json_path,
+            dst: SUBAGENT_CONTEXT_JSON_PATH.to_string(),
+        },
+    ];
+
+    if !codex_skills.is_empty() {
+        let codex_home = context_dir.join("codex-home");
+        let codex_skills_dir = codex_home.join("skills");
+        mkdirp(&codex_skills_dir)?;
+        for skill in &codex_skills {
+            copy_path_recursive(&skill.source_dir, &codex_skills_dir.join(&skill.mount_name))?;
+        }
+        env_map.insert(
+            "NORMIES_CODEX_HOME".to_string(),
+            SUBAGENT_CODEX_HOME.to_string(),
+        );
+        env_map.insert("CODEX_HOME".to_string(), SUBAGENT_CODEX_HOME.to_string());
+        extra_mounts.push(BindMountSpec {
+            src: codex_home,
+            dst: SUBAGENT_CODEX_HOME.to_string(),
+        });
+    }
+
+    Ok(Some(PreparedSubagentContext {
+        env_map,
+        extra_mounts,
+    }))
+}
+
+fn build_skill_manifest_entries(
+    codex_skills: &[DiscoveredSkill],
+    claude_skills: &[DiscoveredSkill],
+) -> Vec<Value> {
+    codex_skills
+        .iter()
+        .chain(claude_skills.iter())
+        .map(|skill| {
+            json!({
+                "runtime": skill.runtime,
+                "name": skill.name,
+                "description": skill.description,
+                "path": skill.relative_path,
+            })
+        })
+        .collect()
+}
+
+fn build_subagent_agents_block(
+    agents_files: &[String],
+    codex_skills: &[DiscoveredSkill],
+    claude_skills: &[DiscoveredSkill],
+) -> String {
+    let mut out = String::new();
+    out.push_str(SUBAGENT_BLOCK_START);
+    out.push_str(
+        "\n## Subagent Context\n\nWhen spawning subagents from this worktree, apply the closest `AGENTS.md` for the delegated path and choose the smallest relevant set of skills for the task.\n\nUse `NORMIES_SUBAGENT_CONTEXT_JSON` for the full discovered context.\n",
+    );
+
+    if !agents_files.is_empty() {
+        out.push_str("\n### Discovered `AGENTS.md`\n");
+        for path in agents_files {
+            out.push_str(&format!("- `{path}`\n"));
+        }
+    }
+    if !codex_skills.is_empty() {
+        out.push_str(
+            "\n### Codex Skills\n`normies` mounts these under `$CODEX_HOME/skills` inside the agent container.\n",
+        );
+        append_skill_lines(&mut out, codex_skills);
+    }
+    if !claude_skills.is_empty() {
+        out.push_str("\n### Claude Skills\n");
+        append_skill_lines(&mut out, claude_skills);
+    }
+
+    out.push_str(SUBAGENT_BLOCK_END);
+    out.push('\n');
+    out
+}
+
+fn append_skill_lines(out: &mut String, skills: &[DiscoveredSkill]) {
+    for skill in skills {
+        out.push_str(&format!(
+            "- `{}`: {} (`{}`)\n",
+            skill.name, skill.description, skill.relative_path
+        ));
+    }
+}
+
+fn discover_named_files(root: &Path, target_name: &str) -> Result<Vec<String>> {
+    let mut matches = vec![];
+    walk_repo_files(root, root, &mut |path| {
+        if path.file_name().and_then(|name| name.to_str()) == Some(target_name) {
+            matches.push(path.to_path_buf());
+        }
+        Ok(())
+    })?;
+    matches.sort();
+    Ok(matches
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(root).ok().map(normalize_rel_path))
+        .collect())
+}
+
+fn discover_skills(
+    worktree: &Path,
+    roots: &[(&'static str, PathBuf)],
+) -> Result<Vec<DiscoveredSkill>> {
+    let mut skills = vec![];
+    let mut seen_mount_names = HashSet::new();
+
+    for (runtime, root) in roots {
+        if !root.exists() {
+            continue;
+        }
+        let mut files = vec![];
+        walk_repo_files(root, worktree, &mut |path| {
+            if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+                files.push(path.to_path_buf());
+            }
+            Ok(())
+        })?;
+        files.sort();
+        for file in files {
+            let source_dir = file
+                .parent()
+                .ok_or_else(|| anyhow!("skill file missing parent: {}", file.display()))?
+                .to_path_buf();
+            let rel_dir = source_dir
+                .strip_prefix(root)
+                .ok()
+                .unwrap_or(source_dir.as_path());
+            let relative_path =
+                normalize_rel_path(file.strip_prefix(worktree).ok().unwrap_or(file.as_path()));
+            let metadata = read_skill_frontmatter(&file)?;
+            let mount_name = unique_mount_name(rel_dir, &mut seen_mount_names);
+            skills.push(DiscoveredSkill {
+                runtime,
+                name: metadata.name.unwrap_or_else(|| {
+                    source_dir
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("skill")
+                        .to_string()
+                }),
+                description: metadata
+                    .description
+                    .unwrap_or_else(|| "No description provided.".to_string()),
+                relative_path,
+                source_dir,
+                mount_name,
+            });
+        }
+    }
+
+    Ok(skills)
+}
+
+fn unique_mount_name(rel_dir: &Path, seen: &mut HashSet<String>) -> String {
+    let raw = normalize_rel_path(rel_dir);
+    let base = if raw.is_empty() {
+        "skill".to_string()
+    } else {
+        raw.replace('/', "__")
+    };
+    if seen.insert(base.clone()) {
+        return base;
+    }
+    for idx in 2..1000 {
+        let candidate = format!("{base}-{idx}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    format!("{base}-overflow")
+}
+
+fn read_skill_frontmatter(path: &Path) -> Result<SkillFrontmatter> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if let Some((frontmatter, body)) = split_frontmatter(&text) {
+        let mut parsed: SkillFrontmatter = serde_yaml::from_str(frontmatter)
+            .with_context(|| format!("failed to parse frontmatter in {}", path.display()))?;
+        if parsed.description.is_none() {
+            parsed.description = first_skill_body_line(body);
+        }
+        return Ok(parsed);
+    }
+
+    Ok(SkillFrontmatter {
+        name: None,
+        description: first_skill_body_line(&text),
+    })
+}
+
+fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let remainder = text.strip_prefix("---\n")?;
+    let (frontmatter, body) = remainder.split_once("\n---\n")?;
+    Some((frontmatter, body))
+}
+
+fn first_skill_body_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("```"))
+        .map(ToString::to_string)
+}
+
+fn walk_repo_files<F>(dir: &Path, root: &Path, visit: &mut F) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .with_context(|| format!("failed to read dir {}", dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to enumerate {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_type.is_dir() {
+            if should_skip_subagent_scan(root, &path, &name) {
+                continue;
+            }
+            walk_repo_files(&path, root, visit)?;
+            continue;
+        }
+        visit(&path)?;
+    }
+    Ok(())
+}
+
+fn should_skip_subagent_scan(root: &Path, path: &Path, name: &str) -> bool {
+    if path == root.join(".git") {
+        return true;
+    }
+    matches!(
+        name,
+        ".git"
+            | ".orchestrator"
+            | "node_modules"
+            | "target"
+            | ".next"
+            | "dist"
+            | "build"
+            | ".venv"
+            | "venv"
+    )
+}
+
+fn normalize_rel_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    if raw.is_empty() || raw == "." {
+        String::new()
+    } else {
+        raw
+    }
+}
+
+fn copy_path_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if src.is_dir() {
+        mkdirp(dst)?;
+        for entry in
+            fs::read_dir(src).with_context(|| format!("failed to read dir {}", src.display()))?
+        {
+            let entry = entry?;
+            copy_path_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = dst.parent() {
+        mkdirp(parent)?;
+    }
+    fs::copy(src, dst)
+        .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
 fn prepare_agent(
     ctx: &PrepareContext<'_>,
     agent: &AgentSpec,
@@ -2315,6 +2724,14 @@ fn prepare_agent(
         env_map.insert("NORMIES_A2A_PEERS_JSON".to_string(), peers_json.clone());
         gateway_dir = Some(gateway.gateway_dir.to_path_buf());
     }
+    let subagent_context = prepare_subagent_context(&agent_dir, &worktree)?;
+    let mut extra_mounts = vec![];
+    if let Some(subagent) = &subagent_context {
+        for (k, v) in &subagent.env_map {
+            env_map.insert(k.clone(), v.clone());
+        }
+        extra_mounts = subagent.extra_mounts.clone();
+    }
     for (k, v) in &agent.env {
         env_map.insert(k.clone(), v.clone());
     }
@@ -2347,6 +2764,7 @@ fn prepare_agent(
         container_name,
         env_map,
         gateway_dir,
+        extra_mounts,
     })
 }
 
@@ -2498,6 +2916,7 @@ fn execute_agent(agent: PreparedAgent) -> Result<AgentState> {
         needs_network: agent.needs_network,
         read_only_rootfs: agent.read_only_rootfs,
         gateway_dir: agent.gateway_dir.clone(),
+        extra_mounts: agent.extra_mounts.clone(),
     })?;
 
     let exit_code = run_logged(&docker_cmd, &agent.log_path, None)?;

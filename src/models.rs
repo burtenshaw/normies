@@ -76,7 +76,7 @@ pub struct AgentSkillSpec {
     pub examples: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentA2aConfig {
     pub serve: bool,
@@ -84,17 +84,6 @@ pub struct AgentA2aConfig {
     #[serde(default)]
     pub skills: Vec<AgentSkillSpec>,
     pub streaming: Option<bool>,
-}
-
-impl Default for AgentA2aConfig {
-    fn default() -> Self {
-        Self {
-            serve: false,
-            description: None,
-            skills: vec![],
-            streaming: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +179,12 @@ pub struct CommitInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct BindMountSpec {
+    pub src: PathBuf,
+    pub dst: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PreparedAgent {
     pub name: String,
     pub branch: String,
@@ -212,4 +207,5 @@ pub struct PreparedAgent {
     pub container_name: String,
     pub env_map: HashMap<String, String>,
     pub gateway_dir: Option<PathBuf>,
+    pub extra_mounts: Vec<BindMountSpec>,
 }

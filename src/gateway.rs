@@ -7,7 +7,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
@@ -125,6 +125,17 @@ struct GatewayState {
     token_to_agent: Arc<HashMap<String, String>>,
     stats: Arc<GatewayStats>,
     log_file: Arc<Mutex<fs::File>>,
+}
+
+#[derive(Clone)]
+struct StreamProxyContext {
+    stats: Arc<GatewayStats>,
+    idle_timeout: Duration,
+    log_file: Arc<Mutex<fs::File>>,
+    run_id: String,
+    caller_agent: String,
+    target_agent: String,
+    target_path: String,
 }
 
 pub struct GatewayHandle {
@@ -453,7 +464,7 @@ async fn proxy_task_cancel(
     proxy_to_agent(
         state,
         agent,
-        format!("/tasks/{task_id}:cancel"),
+        format!("/tasks/{task_id}"),
         Method::POST,
         headers,
         body,
@@ -565,7 +576,15 @@ async fn proxy_to_agent(
     Ok(build_proxy_response(
         upstream,
         if stream_response {
-            Some(Arc::clone(&state.stats))
+            Some(StreamProxyContext {
+                stats: Arc::clone(&state.stats),
+                idle_timeout: Duration::from_millis(state.stream_idle_timeout_ms),
+                log_file: Arc::clone(&state.log_file),
+                run_id: state.run_id.clone(),
+                caller_agent,
+                target_agent,
+                target_path,
+            })
         } else {
             None
         },
@@ -574,14 +593,78 @@ async fn proxy_to_agent(
 
 fn build_proxy_response(
     resp: hyper::Response<Incoming>,
-    stats: Option<Arc<GatewayStats>>,
+    stream_ctx: Option<StreamProxyContext>,
 ) -> Response {
     let (parts, body) = resp.into_parts();
-    let guard = stats.map(|s| s.open_stream());
-    let stream = body.into_data_stream().inspect(move |_| {
-        let _ = &guard;
-    });
-    Response::from_parts(parts, Body::from_stream(stream))
+    let stream = match stream_ctx {
+        None => Body::from_stream(body.into_data_stream()),
+        Some(ctx) => {
+            let stream = stream::unfold(
+                (
+                    body.into_data_stream(),
+                    Some(ctx.stats.open_stream()),
+                    ctx,
+                    false,
+                ),
+                |(mut upstream, guard, ctx, terminal)| async move {
+                    if terminal {
+                        return None;
+                    }
+
+                    match timeout(ctx.idle_timeout, upstream.next()).await {
+                        Ok(Some(Ok(chunk))) => Some((
+                            Ok::<Bytes, std::io::Error>(chunk),
+                            (upstream, guard, ctx, false),
+                        )),
+                        Ok(Some(Err(err))) => {
+                            ctx.stats.proxy_errors.fetch_add(1, Ordering::Relaxed);
+                            log_line(
+                                &ctx.log_file,
+                                &format!(
+                                    "proxy stream error run_id={} caller={} target={} path={} err={}",
+                                    ctx.run_id,
+                                    ctx.caller_agent,
+                                    ctx.target_agent,
+                                    ctx.target_path,
+                                    err
+                                ),
+                            );
+                            Some((
+                                Err(std::io::Error::other(format!(
+                                    "upstream stream failed: {err}"
+                                ))),
+                                (upstream, guard, ctx, true),
+                            ))
+                        }
+                        Ok(None) => None,
+                        Err(_) => {
+                            ctx.stats.proxy_errors.fetch_add(1, Ordering::Relaxed);
+                            log_line(
+                                &ctx.log_file,
+                                &format!(
+                                    "proxy stream idle timeout run_id={} caller={} target={} path={} idle_timeout_ms={}",
+                                    ctx.run_id,
+                                    ctx.caller_agent,
+                                    ctx.target_agent,
+                                    ctx.target_path,
+                                    ctx.idle_timeout.as_millis()
+                                ),
+                            );
+                            Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "upstream stream idle timeout",
+                                )),
+                                (upstream, guard, ctx, true),
+                            ))
+                        }
+                    }
+                },
+            );
+            Body::from_stream(stream)
+        }
+    };
+    Response::from_parts(parts, stream)
 }
 
 fn copy_proxy_headers(dst: &mut HeaderMap, src: &HeaderMap) {
@@ -720,11 +803,13 @@ mod tests {
     use anyhow::Result;
     use axum::extract::Request;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use axum::routing::post;
     use axum::{Router, body::Bytes};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::oneshot;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn missing_auth_is_unauthorized() -> Result<()> {
@@ -828,6 +913,190 @@ mod tests {
         assert!(text.contains("\"caller\":\"a\""), "unexpected body: {text}");
 
         let _ = handle.stop()?;
+        let _ = upstream_shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proxies_task_cancel_without_duplicate_suffix() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let target_socket = tmp.path().join("target.sock");
+        let gateway_socket = tmp.path().join("gateway.sock");
+        let gateway_log = tmp.path().join("gateway.log");
+
+        let (upstream_shutdown_tx, upstream_shutdown_rx) = oneshot::channel::<()>();
+        let target_socket_clone = target_socket.clone();
+        tokio::spawn(async move {
+            let _ = fs::remove_file(&target_socket_clone);
+            let listener = UnixListener::bind(&target_socket_clone).expect("bind target");
+            let app = Router::new().without_v07_checks().route(
+                "/tasks/{task_id}",
+                post(|Path(task_id): Path<String>| async move {
+                    Json(serde_json::json!({ "task_id": task_id }))
+                }),
+            );
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = upstream_shutdown_rx.await;
+                })
+                .await
+                .expect("upstream server");
+        });
+
+        let mut handle = start_gateway(GatewayStartOptions {
+            run_id: "run-gateway-cancel-test".to_string(),
+            socket_path: gateway_socket.clone(),
+            log_path: gateway_log,
+            bind_timeout_ms: 2000,
+            request_timeout_ms: 2000,
+            stream_idle_timeout_ms: 5000,
+            max_payload_bytes: 1024 * 1024,
+            token_by_agent: HashMap::from([("a".to_string(), "tok-a".to_string())]),
+            agents: vec![
+                GatewayStartAgent {
+                    name: "a".to_string(),
+                    serve: false,
+                    description: None,
+                    skills: vec![],
+                    streaming: false,
+                    socket_path: tmp.path().join("a.sock"),
+                },
+                GatewayStartAgent {
+                    name: "b".to_string(),
+                    serve: true,
+                    description: Some("b".to_string()),
+                    skills: vec![],
+                    streaming: false,
+                    socket_path: target_socket,
+                },
+            ],
+        })?;
+
+        let connector = UdsConnector::new(gateway_socket);
+        let client: Client<UdsConnector, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(connector);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("http://a2a.local/v1/agents/b/tasks/task-123:cancel")
+            .header(AUTHORIZATION, "Bearer tok-a")
+            .body(Full::new(Bytes::new()))?;
+        let res = client.request(req).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await?.to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("\"task_id\":\"task-123:cancel\""),
+            "unexpected body: {text}"
+        );
+
+        let _ = handle.stop()?;
+        let _ = upstream_shutdown_tx.send(());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_proxy_enforces_idle_timeout() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let target_socket = tmp.path().join("target.sock");
+        let gateway_socket = tmp.path().join("gateway.sock");
+        let gateway_log = tmp.path().join("gateway.log");
+
+        let (upstream_shutdown_tx, upstream_shutdown_rx) = oneshot::channel::<()>();
+        let target_socket_clone = target_socket.clone();
+        tokio::spawn(async move {
+            let _ = fs::remove_file(&target_socket_clone);
+            let listener = UnixListener::bind(&target_socket_clone).expect("bind target");
+            let app = Router::new().without_v07_checks().route(
+                "/message:stream",
+                post(|| async move {
+                    let body = Body::from_stream(stream::unfold(0usize, |state| async move {
+                        match state {
+                            0 => {
+                                Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(b"first")), 1))
+                            }
+                            1 => {
+                                sleep(Duration::from_millis(150)).await;
+                                Some((
+                                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"second")),
+                                    2,
+                                ))
+                            }
+                            _ => None,
+                        }
+                    }));
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/octet-stream")
+                        .body(body)
+                        .expect("response")
+                        .into_response()
+                }),
+            );
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = upstream_shutdown_rx.await;
+                })
+                .await
+                .expect("upstream server");
+        });
+
+        let mut handle = start_gateway(GatewayStartOptions {
+            run_id: "run-gateway-timeout-test".to_string(),
+            socket_path: gateway_socket.clone(),
+            log_path: gateway_log,
+            bind_timeout_ms: 2000,
+            request_timeout_ms: 2000,
+            stream_idle_timeout_ms: 50,
+            max_payload_bytes: 1024 * 1024,
+            token_by_agent: HashMap::from([("a".to_string(), "tok-a".to_string())]),
+            agents: vec![
+                GatewayStartAgent {
+                    name: "a".to_string(),
+                    serve: false,
+                    description: None,
+                    skills: vec![],
+                    streaming: false,
+                    socket_path: tmp.path().join("a.sock"),
+                },
+                GatewayStartAgent {
+                    name: "b".to_string(),
+                    serve: true,
+                    description: Some("b".to_string()),
+                    skills: vec![],
+                    streaming: true,
+                    socket_path: target_socket,
+                },
+            ],
+        })?;
+
+        let connector = UdsConnector::new(gateway_socket);
+        let client: Client<UdsConnector, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(connector);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("http://a2a.local/v1/agents/b/message:stream")
+            .header(AUTHORIZATION, "Bearer tok-a")
+            .body(Full::new(Bytes::from_static(br#"{"stream":"ok"}"#)))?;
+        let res = client.request(req).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut body = res.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first frame result")
+            .expect("first frame");
+        let first = first.into_data().expect("first frame bytes");
+        assert_eq!(first, Bytes::from_static(b"first"));
+
+        let second = body.frame().await.expect("second frame result");
+        assert!(second.is_err(), "expected stream idle timeout");
+
+        let telemetry = handle.stop()?;
+        assert!(
+            telemetry.proxy_errors >= 1,
+            "expected proxy error count after idle timeout: {telemetry:?}"
+        );
         let _ = upstream_shutdown_tx.send(());
         Ok(())
     }
